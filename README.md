@@ -48,7 +48,7 @@ go build -o movcaster .
 movcaster -l
 
 # Cast it. Subtitles and codecs are figured out for you.
-movcaster "Hannibal S01E01.mkv"
+movcaster "Some Show S01E01.mkv"
 ```
 
 That's the whole pitch: point it at a file, hit play, grab the popcorn. 🍿
