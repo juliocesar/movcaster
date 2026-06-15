@@ -1,5 +1,10 @@
 # movcaster
 
+[![Release](https://img.shields.io/github/v/release/juliocesar/movcaster?sort=semver)](https://github.com/juliocesar/movcaster/releases/latest)
+[![Homebrew](https://img.shields.io/badge/brew-juliocesar%2Ftap%2Fmovcaster-orange?logo=homebrew)](https://github.com/juliocesar/homebrew-tap)
+[![Release workflow](https://img.shields.io/github/actions/workflow/status/juliocesar/movcaster/release.yml?label=release)](https://github.com/juliocesar/movcaster/actions/workflows/release.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/juliocesar/movcaster.svg)](https://pkg.go.dev/github.com/juliocesar/movcaster)
+
 Throw a movie from your laptop onto the TV from the comfort of your terminal. 📺
 
 movcaster is a terminal-only (CLI + TUI) tool that streams local video to a DLNA
