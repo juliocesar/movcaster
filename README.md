@@ -1,9 +1,11 @@
 # movcaster
 
-A terminal-only (CLI + TUI) tool to stream local video to a DLNA renderer
-(built for an LG webOS TV) over wifi, with **soft** *and* **burned-in** subtitle
-support — including bitmap subtitle tracks (VobSub/PGS/`dvd_subtitle`) that
-go2tv cannot show.
+Throw a movie from your laptop onto the TV from the comfort of your terminal. 📺
+
+movcaster is a terminal-only (CLI + TUI) tool that streams local video to a DLNA
+renderer (built for an LG webOS TV) over wifi, with **soft** *and* **burned-in**
+subtitle support — including the bitmap subtitle tracks (VobSub/PGS/`dvd_subtitle`)
+that go2tv just shrugs at. No browser, no app, no cables. One binary.
 
 ## Requirements
 
@@ -16,7 +18,51 @@ go2tv cannot show.
 go build -o movcaster .
 ```
 
-## Usage
+## Quick start
+
+```sh
+# Who's out there?
+movcaster -l
+
+# Cast it. Subtitles and codecs are figured out for you.
+movcaster "Hannibal S01E01.mkv"
+```
+
+That's the whole pitch: point it at a file, hit play, grab the popcorn. 🍿
+
+## More examples
+
+```sh
+# Peek at what's inside (and what subtitle plan it'd pick) without casting:
+movcaster --info "Movie (1080p BluRay x265).mkv"
+
+# Pin a specific TV (handy if you own more than one):
+movcaster -t 192.168.1.42 episode.mkv
+
+# Bring your own subtitles:
+movcaster --sub Movie.es.srt Movie.mkv
+
+# The file has five subtitle tracks and you want track 3 (run --info to list them):
+movcaster --sub-track 3 Movie.mkv
+
+# Force the burned-in path (always works, even on the weirdest bitmap subs):
+movcaster --burn Movie.mkv
+
+# Silence, please — no subtitles at all:
+movcaster --no-subs Movie.mkv
+```
+
+The first device you cast to is remembered (`~/.config/movcaster/config.json`),
+so plain `movcaster <file>` keeps finding your TV — even after it reboots and
+shuffles its DLNA port around.
+
+### TUI controls
+
+Once it's playing you get a little control panel:
+
+`space` play/pause · `←/→` seek 10s · `↑/↓` volume · `m` mute · `q` quit
+
+## All the flags
 
 ```
 movcaster -l                       list DLNA renderers on the LAN
@@ -32,42 +78,40 @@ movcaster <file> --no-subs         cast without subtitles
 movcaster <file> --transcode       force a codec-compatibility transcode
 ```
 
-The first device you cast to is remembered (`~/.config/movcaster/config.json`),
-so later `movcaster <file>` calls find it again even after the TV's DLNA port
-changes on reboot.
-
-### TUI controls
-
-`space` play/pause · `←/→` seek 10s · `↑/↓` volume · `m` mute · `q` quit
-
 ## How subtitles are chosen
 
+movcaster picks a strategy so you don't have to:
+
 1. A sidecar `.srt`/`.vtt` (or `--sub`) → **soft** subs via the DLNA caption
-   mechanism (`sec:CaptionInfoEx`).
+   mechanism (`sec:CaptionInfoEx`). The TV draws them; size/style live in the TV's
+   caption settings.
 2. An embedded **text** track → extracted to WebVTT → **soft**.
 3. A **bitmap** track (`dvd_subtitle`/PGS/VobSub) → **burned in** on the fly with
    ffmpeg `overlay` (playback starts in seconds; no full pre-encode).
    `--mux-soft` instead remuxes it as a soft track to try the TV's own renderer.
 
-Run `movcaster <file> --info` to see the decision without casting.
+Curious what it'll do? `movcaster <file> --info` shows the decision without casting.
 
 ## Seeking
 
-Direct-play files seek natively via HTTP byte ranges. During a transcode
-(burn-in or codec fallback) the stream is not byte-seekable, so seeking restarts
-ffmpeg at the new offset (`-ss`) and re-points the TV at the fresh stream.
+Direct-play files seek natively via HTTP byte ranges. During a transcode (burn-in
+or codec fallback) the stream isn't byte-seekable, so a seek restarts ffmpeg at the
+new offset (`-ss`) and re-points the TV at the fresh stream. You scrub; it copes.
 
 ## Layout
 
+All the orchestration lives behind `internal/core`, so the CLI is a thin client —
+and a future HTTP/GUI front-end would be too.
+
 ```
-main.go                  flag parsing, wiring, lifecycle
+main.go                  thin CLI: parse flags -> core.CastRequest -> render + drive TUI
+internal/core            the reusable API: plan a cast, start it, control it, tear it down
 internal/discovery       SSDP discovery (goupnp) -> Device + service clients
 internal/renderer        AVTransport + RenderingControl + DIDL-Lite building
 internal/mediaserver     local HTTP server (direct-play range + transcode pipe)
 internal/probe           ffprobe wrapper + subtitle classification
 internal/subs            subtitle strategy + extract/burn/remux ffmpeg args
 internal/transcode       codec-compatibility transcode args
-internal/cast            session controller (direct-play vs seek-restart)
 internal/tui             bubbletea view layer
 internal/config          remembers the last device
 ```
