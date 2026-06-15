@@ -250,7 +250,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.hasVol {
 			return m, nil
 		}
-		m.volume = clamp(m.volume+5, 0, 100)
+		m.volume = clamp(m.volume+1, 0, 100)
 		v := m.volume
 		return m, actionCmd(func(c context.Context) error { return m.ctrl.SetVolume(c, v) })
 
@@ -258,7 +258,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.hasVol {
 			return m, nil
 		}
-		m.volume = clamp(m.volume-5, 0, 100)
+		m.volume = clamp(m.volume-1, 0, 100)
 		v := m.volume
 		return m, actionCmd(func(c context.Context) error { return m.ctrl.SetVolume(c, v) })
 

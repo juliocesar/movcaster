@@ -12,42 +12,73 @@ Module: `github.com/juliocesar/movcaster` · Go 1.26 · deps: `huin/goupnp` (DLN
 
 ## Data flow (one cast)
 
+All orchestration lives in `internal/core`. `main` is a thin client: parse flags →
+build a `core.CastRequest` → call core → render `core.Event`s and drive the TUI.
+
 ```
-main.runCast
-  ├─ ensureFFmpeg()                          verify ffmpeg+ffprobe on PATH
-  ├─ selectDevice(target)  ── discovery ──►  SSDP find renderer (or saved/--t)
-  ├─ mediaserver.New(devHost)                bind HTTP on LAN IP routable to TV
+main.runCast → core.App.Start(ctx, CastRequest)
+  ├─ Doctor()                                verify ffmpeg+ffprobe on PATH
+  ├─ selectDevice(target)  ── DeviceFinder ─► SSDP find renderer (or saved/--t)
+  │    └─ emit Event "Casting to …"          + Store.Save(LastDeviceHost)
+  ├─ Prepare(): probe.Probe + subs.Decide    MediaInfo + subtitle Decision (no TV I/O)
+  ├─ newServer(devHost)                      bind HTTP on LAN IP routable to TV
   │    └─ SetDirectPlay(file)                default: serve raw file (range-seek)
-  ├─ probe.Probe(file)                       ffprobe → MediaInfo (codecs, sub tracks, duration)
   ├─ media.Duration = info.Duration          DIDL res@duration (fixes transcode seek bar)
-  ├─ setupSubtitles(...)  ── subs.Decide ──► strategy; may switch server to transcode pipe
-  ├─ transcode.Needs(info)                   codec fallback if not already transcoding
+  ├─ applySubtitles(...)                      apply Decision; may switch server to transcode pipe
+  ├─ codecPlan(info) → transcode.Args         codec fallback if not already transcoding
   ├─ renderer.SetMedia(media) + Play()       SOAP SetAVTransportURI(+DIDL) then Play
-  └─ cast.New(...) → tui.Run(session)        TUI drives the Session controller until quit
+  └─ returns *core.Cast → tui.Run(cast)      TUI drives the Cast controller until quit
+                                             → cast.Close() tears down server+ffmpeg+tmp
 ```
 
 The TV pulls media from our HTTP server; we push control via SOAP to the TV. Two
 independent channels.
+
+Planning (`--info`) reuses `core.Prepare` alone (no device, no TV): probe + decide,
+then `Preparation.DescribeStreams()` / `DescribeStrategy()` render the text.
 
 ---
 
 ## Packages
 
 ### `main` (main.go)
-Flag parsing, wiring, lifecycle. Subcommands by flag.
+Thin CLI client: flag parsing + map to `core.CastRequest` + render events. No
+orchestration logic.
 - `main()` — flags: `-l -t -sub -no-subs -burn -soft -sub-track -mux-soft -transcode -info`.
-- `runList()` — `-l`: print discovered renderers.
-- `runInfo(path, opts)` — `--info`: print streams + chosen subtitle strategy, no cast.
-- `runCast(path, opts)` — the main path (see flow above).
-- `setupSubtitles(srv, &media, abs, tmpDir, info, opts) → subResult` — runs `subs.Decide`
-  and APPLIES it: soft→`srv.SetSubtitle`+set `media.Sub*`; bitmap burn→`applyTranscode`
-  (returns `buildTranscode` closure); mux-soft→remux+`SetDirectPlay`. `subResult{label, buildTranscode}`.
-- `applyTranscode(srv,&media,build)` — switch server+media to transcode-from-0.
-- `selectDevice(ctx,target)` — resolve target: explicit `-t` (match by host IP, then
-  `FindByURL`) → saved config host → sole device → error.
-- helpers: `resolveSubtitle` (sidecar `.srt/.vtt` or `--sub`), `subKind` (mime/sec:type),
-  `mimeForExt`, `hostOf`/`ensureScheme`, `ensureFFmpeg`.
-- `castOpts{target,sub,noSubs,burn,soft,muxSoft,transcode,subTrack}`.
+  Builds one `core.App` with an `OnEvent` reporter.
+- `report(Event)` — `Info`→stdout, `Warn`→stderr with the `movcaster:` prefix. This is
+  the one place core's progress lines become terminal output.
+- `runList(app)` — `-l`: `app.ListDevices` + print.
+- `runInfo(app, req)` — `--info`: `app.Prepare` then print `DescribeStreams`/`DescribeStrategy`.
+  ProbeErr is fatal (matches old behavior: aborts before printing); DecideErr prints
+  streams then errors.
+- `runCast(app, req)` — `app.Start` → `tui.Run(cast, …)` → `cast.Close` on quit.
+
+### `internal/core` — UI-agnostic orchestration (the reusable API)
+One import exposes everything a front-end needs. No UI toolkit, no `fmt.Println`;
+progress is reported via `Options.OnEvent`, status via the live `Cast`.
+- `App` + `New(Options)` — holds injectable deps (`DeviceFinder`, `NewServer`,
+  `NewRenderer`, `Store`, `OnEvent`); zero-value Options wires production impls.
+- `Doctor()` — ffmpeg/ffprobe on PATH (was `ensureFFmpeg`).
+- `ListDevices(ctx)` — discovery passthrough.
+- `Prepare(ctx, CastRequest) → *Preparation` — pure planning: probe + `subs.Decide`, no
+  TV/network I/O. `Preparation{AbsPath, Info, Sidecar, Strategy, ProbeErr, DecideErr}` +
+  `DescribeStreams()`/`DescribeStrategy()`. Reused by `--info` and `Start`.
+- `Start(ctx, CastRequest) → (*Cast, *Preparation)` — resolve device (emit "Casting to",
+  save config), bind server, `applySubtitles`, codec fallback (`codecPlan`), SetMedia+Play.
+  Cleans up the server/tmp dir on any post-bind error.
+- `Cast` — the live, concurrency-safe handle (folds the former `internal/cast.Session`).
+  Implements the TUI control surface: `Play/Pause/Stop/Seek/Position/TransportState/
+  HasVolume/Volume/SetVolume/Mute`, plus `Title/Device/SubInfo`, `Status(ctx)`, `Close(ctx)`.
+  Direct-play vs transcode seek-restart logic (Stop→settle→retry SetURI/Play, `seekMu`
+  serialized) lives here, moved verbatim from the old Session.
+- Interfaces (consumer-side, with compile-time assertions): `DeviceFinder`,
+  `RendererControl` (`*renderer.Renderer`), `MediaServer` (`*mediaserver.Server`), `Store`
+  (`config`). Tests inject fakes; production defaults wire the real impls.
+- `CastRequest`/`SubtitleOptions`/`TranscodePlan`/`Event`/`Status`/`Options` — public data.
+- internal helpers: `selectDevice` (target by host IP → saved → sole → error),
+  `resolveSubtitle`, `subKind`, `mimeForExt`, `hostOf`/`ensureScheme`, `applyTranscode`,
+  `applySubtitles`, `codecPlan`, `retrySOAP`, `sleepCtx`.
 
 ### `internal/discovery` — SSDP discovery (goupnp)
 - `Device{FriendlyName, Location *url.URL, AVTransport *av1.AVTransport1, Rendering *av1.RenderingControl1}`.
@@ -105,19 +136,12 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   (good video: h264/hevc/mpeg4/mpeg2video/vc1/msmpeg4v3; good audio: aac/ac3/eac3/mp3/mp2/dts/flac).
 - `Args(input,ss,tV,tA) []string` — like BurnArgs minus subs; copies stream if not transcoding it.
 
-### `internal/cast` — Session controller (the seek brain)
-- `Session` implements `tui.Controller`. Wraps renderer+server. `transcoding()` = `buildArgs != nil`.
-- Play/Pause/Stop/volume/state delegate to renderer.
-- `Position` — transcode: `ssOffset + TVpos` (TV pos is segment-relative), dur=`knownDuration`.
-  Direct-play: passthrough.
-- `Seek(ctx,pos)` — direct-play: native `r.Seek`. Transcode = **seek-restart**, guarded by
-  `seekMu` (serialized): `Stop`(4s) → settle 500ms → `SetTranscode(buildArgs(pos))` → new URL →
-  `retrySOAP(SetMedia)` → `retrySOAP(Play)` → set `ssOffset=pos`.
-- `retrySOAP(parent,attempts,perCall,fn)` — per-call timeout + backoff; aborts on parent ctx.
-- `sleepCtx` — ctx-cancellable sleep.
+> The seek brain (former `internal/cast.Session`) now lives in `internal/core` as
+> `Cast` — see the core section above. The `internal/cast` package was removed.
 
 ### `internal/tui` — bubbletea view (thin)
-- `Controller` interface = the playback surface (cast.Session implements it).
+- `Controller` interface = the playback surface (`*core.Cast` implements it; the
+  assertion in tui still references `*renderer.Renderer`, which also satisfies it).
 - `Run(ctrl, Options{Title,Device,SubInfo,HasVolume})`. Elm loop: `model.Init/Update/View`.
 - Polling: `tickCmd` every 1s → `pollCmd` (Position+TransportState). **Skipped while `seeking`**
   to avoid SOAP contention with a seek-restart.
@@ -151,8 +175,9 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 
 ## Verification notes
 
-- Unit tests: `subs` (decision tree), `renderer` (DIDL/duration), `tui` (view + seek debounce).
-  `go test ./...`.
+- Unit tests: `subs` (decision tree), `renderer` (DIDL/duration), `tui` (view + seek debounce),
+  `core` (device resolution, seek-restart call sequence, position offset math, subtitle apply +
+  events, codec plan) using fakes for the three interfaces. `go test ./...`.
 - Live behaviors (against the real TV) were verified with throwaway harnesses under a
   temporary `cmd/` dir, then deleted — recreate similarly to re-verify discovery, direct-play
   seek, controls, soft-sub fetch, burn-in, seek-restart. TUI needs a TTY (drive via `script`).
