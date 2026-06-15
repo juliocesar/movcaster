@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+#
+# release - cut a new movcaster release.
+#
+# Bumps the latest vX.Y.Z git tag, pushes the new tag, and lets GoReleaser
+# (triggered by the tag push) build the binaries and update the Homebrew tap.
+#
+# Usage:
+#   scripts/release [patch|minor|major]   # default: patch
+#
+# Examples:
+#   scripts/release          # v0.3.0 -> v0.3.1
+#   scripts/release minor    # v0.3.1 -> v0.4.0
+#   scripts/release major    # v0.4.0 -> v1.0.0
+
+set -euo pipefail
+
+bump="${1:-patch}"
+case "$bump" in
+	patch | minor | major) ;;
+	*)
+		echo "usage: $(basename "$0") [patch|minor|major]" >&2
+		exit 2
+		;;
+esac
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Must be on main with a clean tree, in sync with the remote.
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$branch" != "main" ]; then
+	echo "error: releases are cut from main, but you are on '$branch'" >&2
+	exit 1
+fi
+if [ -n "$(git status --porcelain)" ]; then
+	echo "error: working tree is dirty; commit or stash first" >&2
+	exit 1
+fi
+git fetch --quiet origin main
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+	echo "error: local main is not in sync with origin/main; push or pull first" >&2
+	exit 1
+fi
+
+# Latest vX.Y.Z tag (0.0.0 if there are none yet).
+latest="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+latest="${latest:-v0.0.0}"
+
+read -r major minor patch <<<"$(echo "${latest#v}" | tr '.' ' ')"
+case "$bump" in
+	major)
+		major=$((major + 1))
+		minor=0
+		patch=0
+		;;
+	minor)
+		minor=$((minor + 1))
+		patch=0
+		;;
+	patch)
+		patch=$((patch + 1))
+		;;
+esac
+next="v${major}.${minor}.${patch}"
+
+echo "Bumping ${latest} -> ${next} (${bump})"
+git tag -a "$next" -m "$next"
+git push origin "$next"
+
+echo "Pushed tag ${next}. GoReleaser is building the release."
+
+# Follow the release workflow if the GitHub CLI is available.
+if command -v gh >/dev/null 2>&1; then
+	# Give GitHub a moment to register the workflow run for this tag.
+	sleep 5
+	run_id="$(gh run list --workflow=release.yml --event=push -L 20 \
+		--json databaseId,headBranch \
+		-q "map(select(.headBranch == \"$next\")) | .[0].databaseId" 2>/dev/null || true)"
+	if [ -n "${run_id:-}" ] && [ "$run_id" != "null" ]; then
+		gh run watch "$run_id" --exit-status
+	else
+		echo "(could not find the workflow run; check: gh run list --workflow=release.yml)"
+	fi
+	gh release view "$next" --web >/dev/null 2>&1 || true
+fi
+
+echo "Done: ${next} released."
