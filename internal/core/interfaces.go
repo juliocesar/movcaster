@@ -17,6 +17,7 @@ import (
 	"github.com/juliocesar/movcaster/internal/discovery"
 	"github.com/juliocesar/movcaster/internal/mediaserver"
 	"github.com/juliocesar/movcaster/internal/renderer"
+	"github.com/juliocesar/movcaster/internal/resume"
 )
 
 // DeviceFinder discovers DLNA renderers. The production impl wraps the discovery
@@ -60,6 +61,17 @@ type Store interface {
 	Load() config.Config
 	Save(config.Config) error
 }
+
+// resumeStore persists per-file playback positions for the resume feature.
+// *resume.Store satisfies it. It is supplied by the CLI (via Options.Resume) so
+// that core unit tests stay hermetic; when nil, resume is simply disabled.
+type resumeStore interface {
+	Get(absPath string) time.Duration
+	Set(absPath string, pos time.Duration) error
+	Clear(absPath string) error
+}
+
+var _ resumeStore = (*resume.Store)(nil)
 
 // Concrete impls satisfy the interfaces (compile-time checks).
 var (

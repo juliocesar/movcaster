@@ -154,6 +154,15 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 - `Config{LastDeviceHost}` at `os.UserConfigDir()/movcaster/config.json`. `Load`(zero on miss)/`Save`.
   Saved after each cast → bare `movcaster <file>` re-finds the TV across its dynamic-port reboots.
 
+### `internal/resume` — playback position persistence (resume feature)
+- `Store` over `~/.movcaster/playback_index` (JSON object keyed by absolute file path:
+  `{position_seconds, updated_at}`). `New()` creates the dir + an empty `{}` index on
+  construction (so they exist on every run); `Get/Set/Clear` load+rewrite the whole tiny file.
+- Wired by `main` and injected via `core.Options.Resume` (nil in tests → resume disabled).
+  `core.Start` reads it (see `resumeOffset`: skips <5s or within 30s of the end) and starts
+  a transcode at the saved offset / seeks a direct-play file after Play. `core.Cast` caches
+  the last polled position and `Close` persists it (or clears it once finished).
+
 ---
 
 ## Key invariants / gotchas (don't regress)

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/juliocesar/movcaster/internal/discovery"
 	"github.com/juliocesar/movcaster/internal/renderer"
@@ -20,6 +21,7 @@ type App struct {
 	newServer   func(deviceHost string) (MediaServer, error)
 	newRenderer func(discovery.Device) RendererControl
 	store       Store
+	resume      resumeStore
 	onEvent     func(Event)
 }
 
@@ -31,7 +33,10 @@ type Options struct {
 	NewServer   func(deviceHost string) (MediaServer, error)
 	NewRenderer func(discovery.Device) RendererControl
 	Store       Store
-	OnEvent     func(Event)
+	// Resume persists playback positions. The CLI supplies *resume.Store; when
+	// left nil, the resume feature is disabled (e.g. in tests).
+	Resume  resumeStore
+	OnEvent func(Event)
 }
 
 // EventLevel distinguishes user-facing progress from warnings.
@@ -58,6 +63,7 @@ func New(opts Options) *App {
 		newServer:   opts.NewServer,
 		newRenderer: opts.NewRenderer,
 		store:       opts.Store,
+		resume:      opts.Resume,
 		onEvent:     opts.OnEvent,
 	}
 	if a.finder == nil {
@@ -186,4 +192,29 @@ func subKind(path string) (mime, secType string) {
 	default:
 		return "text/srt", "srt"
 	}
+}
+
+// resumeOffset decides where to resume a file: the saved position, unless it is
+// negligible (<5s) or within 30s of the known end (treat as finished -> start over).
+func resumeOffset(saved, knownDur time.Duration) time.Duration {
+	if saved <= 5*time.Second {
+		return 0
+	}
+	if knownDur > 0 && saved >= knownDur-30*time.Second {
+		return 0
+	}
+	return saved
+}
+
+// clock renders a duration as M:SS or H:MM:SS for user-facing messages.
+func clock(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	t := int(d / time.Second)
+	h, m, s := t/3600, (t%3600)/60, t%60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
 }

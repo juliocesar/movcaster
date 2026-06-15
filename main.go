@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/juliocesar/movcaster/internal/core"
+	"github.com/juliocesar/movcaster/internal/resume"
 	"github.com/juliocesar/movcaster/internal/tui"
 )
 
@@ -43,7 +44,14 @@ func main() {
 		return
 	}
 
-	app := core.New(core.Options{OnEvent: report})
+	// Ensure ~/.movcaster + playback_index exist on every run, and enable resume.
+	opts := core.Options{OnEvent: report}
+	if rs, err := resume.New(); err != nil {
+		fmt.Fprintln(os.Stderr, "movcaster: resume disabled:", err)
+	} else {
+		opts.Resume = rs
+	}
+	app := core.New(opts)
 
 	if *list {
 		fail(runList(app))

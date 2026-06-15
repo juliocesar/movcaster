@@ -40,6 +40,12 @@ type Cast struct {
 
 	seekMu sync.Mutex // serializes seek-restarts so two never interleave
 
+	lastPos time.Duration // most recent observed position, for resume on Close
+
+	// resume persistence (nil => disabled)
+	resume     resumeStore
+	resumePath string // absolute file path, key into the resume store
+
 	// teardown
 	closeOnce sync.Once
 	tmpDir    string
@@ -68,20 +74,26 @@ func (c *Cast) Mute(ctx context.Context, on bool) error    { return c.r.Mute(ctx
 // substitute the probed duration (a fragmented stream has no total duration).
 func (c *Cast) Position(ctx context.Context) (pos, dur time.Duration, err error) {
 	pos, dur, err = c.r.Position(ctx)
-	if !c.transcoding() {
-		return pos, dur, err
+	if c.transcoding() {
+		c.mu.Lock()
+		off := c.ssOffset
+		c.mu.Unlock()
+		pos += off
+		if c.knownDuration > 0 {
+			dur = c.knownDuration
+		}
+		if pos > dur && dur > 0 {
+			pos = dur
+		}
 	}
-	c.mu.Lock()
-	off := c.ssOffset
-	c.mu.Unlock()
-	abs := off + pos
-	if c.knownDuration > 0 {
-		dur = c.knownDuration
+	// Cache the latest real position so Close can persist a resume point even
+	// after the TV has been stopped (which zeroes its reported position).
+	if err == nil && pos > 0 {
+		c.mu.Lock()
+		c.lastPos = pos
+		c.mu.Unlock()
 	}
-	if abs > dur && dur > 0 {
-		abs = dur
-	}
-	return abs, dur, err
+	return pos, dur, err
 }
 
 // Status is a synchronous snapshot of the live cast: state, position, duration,
@@ -164,12 +176,33 @@ func (c *Cast) Seek(ctx context.Context, pos time.Duration) error {
 func (c *Cast) Close(ctx context.Context) error {
 	var err error
 	c.closeOnce.Do(func() {
+		c.persistResume()
 		err = c.srv.Shutdown(ctx)
 		if c.tmpDir != "" {
 			_ = os.RemoveAll(c.tmpDir)
 		}
 	})
 	return err
+}
+
+// persistResume records the last observed position so the file resumes there
+// next time. It clears the record once the file is effectively finished, and
+// ignores negligible positions (leaving any earlier record intact).
+func (c *Cast) persistResume() {
+	if c.resume == nil || c.resumePath == "" {
+		return
+	}
+	c.mu.Lock()
+	pos := c.lastPos
+	c.mu.Unlock()
+	switch {
+	case pos < 5*time.Second:
+		return
+	case c.knownDuration > 0 && pos >= c.knownDuration-30*time.Second:
+		_ = c.resume.Clear(c.resumePath)
+	default:
+		_ = c.resume.Set(c.resumePath, pos)
+	}
 }
 
 // Start resolves the device, binds the media server, applies the subtitle and
@@ -254,7 +287,25 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 			if label == "" {
 				label = "transcode"
 			}
-			applyTranscode(srv, &media, build)
+			applyTranscode(srv, &media, build, 0)
+		}
+	}
+
+	// Resume: if we have a saved position for this file, start there. A transcode
+	// stream begins ffmpeg at the offset directly; a direct-play file seeks after
+	// Play. resumeOffset ignores negligible/finished positions.
+	knownDur := time.Duration(0)
+	if prep.Info != nil {
+		knownDur = prep.Info.Duration
+	}
+	startOffset := time.Duration(0)
+	if a.resume != nil {
+		startOffset = resumeOffset(a.resume.Get(abs), knownDur)
+	}
+	if startOffset > 0 {
+		a.emit(Info, "Resuming at %s", clock(startOffset))
+		if build != nil {
+			applyTranscode(srv, &media, build, startOffset)
 		}
 	}
 
@@ -271,10 +322,15 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		return nil, nil, fmt.Errorf("Play: %w", err)
 	}
 
-	knownDur := time.Duration(0)
-	if prep.Info != nil {
-		knownDur = prep.Info.Duration
+	// Direct-play resume: seek after Play (best-effort; the TV may need a moment
+	// to leave the TRANSITIONING state, so retry briefly). Transcode resume is
+	// already baked into the stream offset above.
+	if build == nil && startOffset > 0 {
+		_ = retrySOAP(setCtx, 4, 3*time.Second, func(c context.Context) error {
+			return rend.Seek(c, startOffset)
+		})
 	}
+
 	c := &Cast{
 		r:             rend,
 		srv:           srv,
@@ -286,13 +342,19 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		subInfo:       label,
 		hasVol:        rend.HasVolume(),
 		tmpDir:        tmpDir,
+		resume:        a.resume,
+		resumePath:    abs,
+	}
+	if build != nil {
+		c.ssOffset = startOffset // transcode stream starts at this absolute offset
 	}
 	return c, prep, nil
 }
 
-// applyTranscode points the server + media at the transcode stream from offset 0.
-func applyTranscode(srv MediaServer, media *renderer.Media, build func(time.Duration) []string) {
-	srv.SetTranscode(build(0))
+// applyTranscode points the server + media at the transcode stream starting at
+// the given offset (0 for a fresh cast; the resume position when resuming).
+func applyTranscode(srv MediaServer, media *renderer.Media, build func(time.Duration) []string, ss time.Duration) {
+	srv.SetTranscode(build(ss))
 	media.URL = srv.MediaURL()
 	media.MIME = "video/mp4"
 	media.Seekable = false
@@ -346,7 +408,7 @@ func (a *App) applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir
 		a.emit(Info, "Subtitles: burning in %s track %d (%s) on the fly...", dec.Track.Kind, dec.Track.SubIndex, dec.Track.Codec)
 		track := *dec.Track
 		build = func(ss time.Duration) []string { return subs.BurnArgs(abs, track, ss) }
-		applyTranscode(srv, media, build)
+		applyTranscode(srv, media, build, 0)
 		label = fmt.Sprintf("burn-in: track %d (%s)", dec.Track.SubIndex, dec.Track.Codec)
 		a.emit(Info, "Subtitles: %s", label)
 		return label, build, nil

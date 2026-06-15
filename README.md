@@ -115,6 +115,14 @@ movcaster picks a strategy so you don't have to:
 
 Curious what it'll do? `movcaster <file> --info` shows the decision without casting.
 
+## Resume where you left off
+
+Stop a movie partway and movcaster remembers. Next time you open the same file it
+picks up right where you stopped — no fiddling with the seek bar. Positions are
+saved per file (by absolute path) in `~/.movcaster/playback_index` when playback
+stops or you quit. Finished something? It's cleared automatically, so a rewatch
+starts from the top.
+
 ## Seeking
 
 Direct-play files seek natively via HTTP byte ranges. During a transcode (burn-in
@@ -137,4 +145,5 @@ internal/subs            subtitle strategy + extract/burn/remux ffmpeg args
 internal/transcode       codec-compatibility transcode args
 internal/tui             bubbletea view layer
 internal/config          remembers the last device
+internal/resume          remembers playback position per file (~/.movcaster)
 ```

@@ -299,6 +299,77 @@ func TestApplySubtitlesNone(t *testing.T) {
 	}
 }
 
+// --- resume ---
+
+type fakeResume struct {
+	got     map[string]time.Duration
+	cleared []string
+}
+
+func (f *fakeResume) Get(p string) time.Duration { return f.got[p] }
+func (f *fakeResume) Set(p string, d time.Duration) error {
+	if f.got == nil {
+		f.got = map[string]time.Duration{}
+	}
+	f.got[p] = d
+	return nil
+}
+func (f *fakeResume) Clear(p string) error { f.cleared = append(f.cleared, p); return nil }
+
+func TestResumeOffset(t *testing.T) {
+	cases := []struct {
+		saved, dur, want time.Duration
+	}{
+		{90 * time.Second, 3600 * time.Second, 90 * time.Second}, // normal
+		{2 * time.Second, 3600 * time.Second, 0},                 // negligible
+		{3595 * time.Second, 3600 * time.Second, 0},              // within 30s of end
+		{90 * time.Second, 0, 90 * time.Second},                  // unknown duration still resumes
+	}
+	for _, c := range cases {
+		if got := resumeOffset(c.saved, c.dur); got != c.want {
+			t.Errorf("resumeOffset(%v,%v) = %v, want %v", c.saved, c.dur, got, c.want)
+		}
+	}
+}
+
+func TestCloseSavesPosition(t *testing.T) {
+	fr := &fakeResume{}
+	c := &Cast{srv: &fakeServer{}, resume: fr, resumePath: "/x/movie.mkv", knownDuration: 3600 * time.Second, lastPos: 100 * time.Second}
+	_ = c.Close(context.Background())
+	if fr.got["/x/movie.mkv"] != 100*time.Second {
+		t.Fatalf("saved = %v, want 100s", fr.got["/x/movie.mkv"])
+	}
+}
+
+func TestCloseClearsWhenFinished(t *testing.T) {
+	fr := &fakeResume{}
+	c := &Cast{srv: &fakeServer{}, resume: fr, resumePath: "/x/movie.mkv", knownDuration: 3600 * time.Second, lastPos: 3595 * time.Second}
+	_ = c.Close(context.Background())
+	if len(fr.cleared) != 1 || fr.cleared[0] != "/x/movie.mkv" {
+		t.Fatalf("expected clear of finished file, got cleared=%v set=%v", fr.cleared, fr.got)
+	}
+}
+
+func TestCloseSkipsTinyPosition(t *testing.T) {
+	fr := &fakeResume{}
+	c := &Cast{srv: &fakeServer{}, resume: fr, resumePath: "/x/movie.mkv", knownDuration: 3600 * time.Second, lastPos: 2 * time.Second}
+	_ = c.Close(context.Background())
+	if len(fr.got) != 0 || len(fr.cleared) != 0 {
+		t.Fatalf("tiny position should neither set nor clear: set=%v cleared=%v", fr.got, fr.cleared)
+	}
+}
+
+func TestPositionCachesLastPos(t *testing.T) {
+	r := &fakeRenderer{pos: 30 * time.Second, dur: 100 * time.Second}
+	c := &Cast{r: r, srv: &fakeServer{}} // direct-play
+	if _, _, err := c.Position(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c.lastPos != 30*time.Second {
+		t.Fatalf("lastPos = %v, want 30s", c.lastPos)
+	}
+}
+
 func TestCodecPlan(t *testing.T) {
 	// av1 video is outside the good list -> transcode video only.
 	p := codecPlan(&probe.MediaInfo{VideoCodec: "av1", AudioCodec: "aac"}, false)
