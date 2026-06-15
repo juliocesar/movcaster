@@ -1,0 +1,66 @@
+# GoReleaser config — builds cross-platform binaries, publishes a GitHub Release,
+# and updates the Homebrew tap. Run by .github/workflows/release.yml on tag push.
+# Validate locally with: goreleaser check
+version: 2
+
+project_name: movcaster
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+# Homebrew cask pushed to github.com/juliocesar/homebrew-tap so users can:
+#   brew install juliocesar/tap/movcaster
+# Needs the HOMEBREW_TAP_GITHUB_TOKEN env var (a token that can push to the tap).
+homebrew_casks:
+  - name: movcaster
+    repository:
+      owner: juliocesar
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/juliocesar/movcaster"
+    description: "Stream local video to a DLNA renderer (LG webOS TV) from the terminal"
+    dependencies:
+      - formula: ffmpeg
+    commit_author:
+      name: goreleaser
+      email: noreply@github.com
+    # Strip the macOS quarantine xattr so the downloaded binary runs without a
+    # Gatekeeper prompt.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/movcaster"]
+          end

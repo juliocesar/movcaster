@@ -17,9 +17,14 @@ import (
 	"github.com/juliocesar/movcaster/internal/tui"
 )
 
+// version is set at build time via -ldflags "-X main.version=...". It stays
+// "dev" for plain `go build`/`go install` of an untagged checkout.
+var version = "dev"
+
 func main() {
 	var (
 		list     = flag.Bool("l", false, "list DLNA renderers on the LAN and exit")
+		showVer  = flag.Bool("version", false, "print version and exit")
 		target   = flag.String("t", "", "target device: IP, IP:port, or device description URL")
 		sub      = flag.String("sub", "", "subtitle file to use as soft subs (.srt/.vtt)")
 		noSubs   = flag.Bool("no-subs", false, "do not send any subtitles")
@@ -32,6 +37,11 @@ func main() {
 	)
 	flag.Usage = usage
 	flag.Parse()
+
+	if *showVer {
+		fmt.Println("movcaster", version)
+		return
+	}
 
 	app := core.New(core.Options{OnEvent: report})
 

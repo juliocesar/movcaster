@@ -7,16 +7,34 @@ renderer (built for an LG webOS TV) over wifi, with **soft** *and* **burned-in**
 subtitle support — including the bitmap subtitle tracks (VobSub/PGS/`dvd_subtitle`)
 that go2tv just shrugs at. No browser, no app, no cables. One binary.
 
-## Requirements
+## Install
 
-- Go 1.26+ (to build)
-- `ffmpeg` and `ffprobe` on `PATH` (`brew install ffmpeg`)
+**Homebrew** (macOS/Linux — pulls in `ffmpeg` for you):
 
-## Build
-
+```sh
+brew install juliocesar/tap/movcaster
 ```
+
+**Go** (if you have the toolchain):
+
+```sh
+go install github.com/juliocesar/movcaster@latest
+```
+
+**Prebuilt binaries:** grab a tarball for your OS/arch from the
+[releases page](https://github.com/juliocesar/movcaster/releases), unpack it, and
+drop `movcaster` somewhere on your `PATH`.
+
+**From source:**
+
+```sh
+git clone https://github.com/juliocesar/movcaster && cd movcaster
 go build -o movcaster .
 ```
+
+> **Heads up:** every method except Homebrew assumes `ffmpeg` and `ffprobe` are on
+> your `PATH` already (`brew install ffmpeg`). movcaster shells out to them and will
+> tell you politely if they're missing.
 
 ## Quick start
 
