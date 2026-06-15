@@ -76,7 +76,9 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
   `RendererControl` (`*renderer.Renderer`), `MediaServer` (`*mediaserver.Server`), `Store`
   (`config`). Tests inject fakes; production defaults wire the real impls.
 - `CastRequest`/`SubtitleOptions`/`TranscodePlan`/`Event`/`Status`/`Options` — public data.
-- internal helpers: `selectDevice` (target by host IP → saved → sole → error),
+- internal helpers: `selectDevice` (no target: quick SSDP pass → saved/sole; if none
+  answer, emit "Looking for a TV..." and `waitForDevice` retries up to 10s before erroring.
+  target: `selectTarget` by host IP → description-URL load). `pickDevice` (saved → sole → nil),
   `resolveSubtitle`, `subKind`, `mimeForExt`, `hostOf`/`ensureScheme`, `applyTranscode`,
   `applySubtitles`, `codecPlan`, `retrySOAP`, `sleepCtx`.
 

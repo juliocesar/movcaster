@@ -217,9 +217,8 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		return nil, nil, fmt.Errorf("file: %w", err)
 	}
 
-	devCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	dev, err := a.selectDevice(devCtx, req.Target)
-	cancel()
+	// selectDevice owns its own discovery timeouts (quick pass + deep fallback).
+	dev, err := a.selectDevice(ctx, req.Target)
 	if err != nil {
 		return nil, nil, err
 	}

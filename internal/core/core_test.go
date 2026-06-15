@@ -167,6 +167,53 @@ func TestSelectDeviceByHostIgnoresPort(t *testing.T) {
 	}
 }
 
+// seqFinder returns a different result per Discover call, simulating a renderer
+// that misses the first SSDP burst and only answers a later one.
+type seqFinder struct {
+	results []struct {
+		devices []discovery.Device
+		err     error
+	}
+	n int
+}
+
+func (f *seqFinder) Discover(context.Context) ([]discovery.Device, error) {
+	r := f.results[min(f.n, len(f.results)-1)]
+	f.n++
+	return r.devices, r.err
+}
+func (f *seqFinder) FindByURL(context.Context, *url.URL) (*discovery.Device, error) {
+	return nil, context.Canceled
+}
+
+func TestSelectDeviceFallbackFindsLateRenderer(t *testing.T) {
+	f := &seqFinder{results: []struct {
+		devices []discovery.Device
+		err     error
+	}{
+		{nil, nil}, // quick pass: nothing
+		{[]discovery.Device{device("TV", "10.0.0.5:1234")}, nil}, // deep pass: found
+	}}
+	var events []string
+	a := New(Options{Finder: f, Store: &fakeStore{}, OnEvent: func(e Event) { events = append(events, e.Message) }})
+	d, err := a.selectDevice(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.FriendlyName != "TV" {
+		t.Fatalf("got %q", d.FriendlyName)
+	}
+	found := false
+	for _, m := range events {
+		if strings.Contains(m, "Looking for a TV") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a 'Looking for a TV' event, got %v", events)
+	}
+}
+
 // --- seek-restart (the hard-won sequence) ---
 
 func TestSeekTranscodeRestartSequence(t *testing.T) {

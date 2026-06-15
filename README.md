@@ -12,6 +12,8 @@ renderer (built for an LG webOS TV) over wifi, with **soft** *and* **burned-in**
 subtitle support — including the bitmap subtitle tracks (VobSub/PGS/`dvd_subtitle`)
 that go2tv just shrugs at. No browser, no app, no cables. One binary.
 
+![movcaster casting an .mkv with burned-in subtitles, showing the TUI progress bar and controls](docs/screenshot.png)
+
 ## Install
 
 **Homebrew** (macOS/Linux — pulls in `ffmpeg` for you):

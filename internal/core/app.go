@@ -103,32 +103,86 @@ func (a *App) ListDevices(ctx context.Context) ([]discovery.Device, error) {
 	return a.finder.Discover(ctx)
 }
 
-// selectDevice resolves the target to a device. Empty target picks the saved or
-// sole device. A target matches by host IP (robust to the TV's dynamic control
-// port), falling back to a direct description-URL load.
-func (a *App) selectDevice(ctx context.Context, target string) (*discovery.Device, error) {
-	devices, derr := a.finder.Discover(ctx)
+// Discovery timeouts. The first pass is short (TVs that are awake answer the
+// initial SSDP burst fast); if nothing turns up we search harder for a while,
+// since renderers routinely miss the first M-SEARCH.
+const (
+	quickDiscover = 5 * time.Second
+	deepDiscover  = 10 * time.Second
+)
 
-	if target == "" {
-		if derr != nil {
-			return nil, derr
+// selectDevice resolves the target to a device. Empty target picks the saved or
+// sole device, and when none answer the quick pass it falls back to a longer
+// search (with user feedback) before giving up. A target matches by host IP
+// (robust to the TV's dynamic control port), falling back to a direct
+// description-URL load.
+func (a *App) selectDevice(ctx context.Context, target string) (*discovery.Device, error) {
+	if target != "" {
+		return a.selectTarget(ctx, target)
+	}
+
+	// Quick pass: prefer the saved or sole device if anything answers promptly.
+	qctx, cancel := context.WithTimeout(ctx, quickDiscover)
+	devices, derr := a.finder.Discover(qctx)
+	cancel()
+	if derr == nil {
+		if d := a.pickDevice(devices); d != nil {
+			return d, nil
 		}
-		if saved := a.store.Load().LastDeviceHost; saved != "" {
-			for i := range devices {
-				if devices[i].Location != nil && hostOf(devices[i].Location.Host) == saved {
-					return &devices[i], nil
-				}
-			}
-		}
-		switch len(devices) {
-		case 0:
-			return nil, fmt.Errorf("no renderers found; pass -t with a device IP/URL")
-		case 1:
-			return &devices[0], nil
-		default:
+		if len(devices) > 1 {
 			return nil, fmt.Errorf("%d renderers found; pick one with -t (run -l to list)", len(devices))
 		}
 	}
+
+	// Nothing yet: search harder before giving up, telling the user why we wait.
+	a.emit(Info, "Looking for a TV...")
+	return a.waitForDevice(ctx, deepDiscover)
+}
+
+// pickDevice returns the device to use from a discovery result: the saved
+// device if present, else the sole device. Returns nil when the choice is
+// ambiguous (multiple, none saved) or empty.
+func (a *App) pickDevice(devices []discovery.Device) *discovery.Device {
+	if saved := a.store.Load().LastDeviceHost; saved != "" {
+		for i := range devices {
+			if devices[i].Location != nil && hostOf(devices[i].Location.Host) == saved {
+				return &devices[i]
+			}
+		}
+	}
+	if len(devices) == 1 {
+		return &devices[0]
+	}
+	return nil
+}
+
+// waitForDevice repeatedly discovers until a usable renderer appears or budget
+// elapses. Each pass blocks on its own SSDP search; we retry until the deadline.
+func (a *App) waitForDevice(ctx context.Context, budget time.Duration) (*discovery.Device, error) {
+	dctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	for {
+		devices, err := a.finder.Discover(dctx)
+		if err == nil {
+			if d := a.pickDevice(devices); d != nil {
+				return d, nil
+			}
+			if len(devices) > 1 {
+				return nil, fmt.Errorf("%d renderers found; pick one with -t (run -l to list)", len(devices))
+			}
+		}
+		if !sleepCtx(dctx, 500*time.Millisecond) {
+			return nil, fmt.Errorf("no renderers found after %s; pass -t with a device IP/URL", budget)
+		}
+	}
+}
+
+// selectTarget resolves an explicit target: match a discovered device by host
+// IP, else load the device directly from its description URL.
+func (a *App) selectTarget(ctx context.Context, target string) (*discovery.Device, error) {
+	qctx, cancel := context.WithTimeout(ctx, quickDiscover)
+	devices, _ := a.finder.Discover(qctx)
+	cancel()
 
 	wantHost := hostOf(target)
 	for i := range devices {
@@ -137,7 +191,9 @@ func (a *App) selectDevice(ctx context.Context, target string) (*discovery.Devic
 		}
 	}
 	if u, err := url.Parse(ensureScheme(target)); err == nil && u.Host != "" {
-		if d, err := a.finder.FindByURL(ctx, u); err == nil {
+		uctx, ucancel := context.WithTimeout(ctx, quickDiscover)
+		defer ucancel()
+		if d, err := a.finder.FindByURL(uctx, u); err == nil {
 			return d, nil
 		}
 	}
