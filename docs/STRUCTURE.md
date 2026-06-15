@@ -76,6 +76,10 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
   `RendererControl` (`*renderer.Renderer`), `MediaServer` (`*mediaserver.Server`), `Store`
   (`config`). Tests inject fakes; production defaults wire the real impls.
 - `CastRequest`/`SubtitleOptions`/`TranscodePlan`/`Event`/`Status`/`Options` — public data.
+- `inhibitSleep()` (power_darwin.go; no-op in power_other.go) — while a `Cast` is
+  live it runs `caffeinate -i -w <pid>` to hold a PreventUserIdleSystemSleep
+  assertion. Started in `Start` (stored as `Cast.releaseAwake`), released in
+  `Cast.Close`. The display still sleeps; only the idle stall is prevented.
 - internal helpers: `selectDevice` (no target: quick SSDP pass → saved/sole; if none
   answer, emit "Looking for a TV..." and `waitForDevice` retries up to 10s before erroring.
   target: `selectTarget` by host IP → description-URL load). `pickDevice` (saved → sole → nil),
@@ -183,6 +187,10 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 - **webOS DOES honor `sec:CaptionInfoEx` for TEXT subs** → soft path serves srt/vtt at `/subs`.
 - **serveTranscode sends headers before launching ffmpeg** so SetAVTransportURI doesn't block.
 - `ss` selectors use `0:s:<SubIndex>` (subtitle-stream index), not the absolute stream index.
+- **macOS idle sleep throttles a cast** → when the laptop display sleeps, the system
+  goes idle and suspends our HTTP server + ffmpeg, so the TV stalls ("loading") and
+  only resumes on display wake. A live `Cast` holds `caffeinate -i` (idle-sleep
+  assertion) for its lifetime; the display is allowed to sleep, only the stall isn't.
 
 ## Verification notes
 

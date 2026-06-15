@@ -47,8 +47,9 @@ type Cast struct {
 	resumePath string // absolute file path, key into the resume store
 
 	// teardown
-	closeOnce sync.Once
-	tmpDir    string
+	closeOnce    sync.Once
+	tmpDir       string
+	releaseAwake func() // releases the idle-sleep assertion held while casting
 }
 
 func (c *Cast) transcoding() bool { return c.buildArgs != nil }
@@ -177,6 +178,9 @@ func (c *Cast) Close(ctx context.Context) error {
 	var err error
 	c.closeOnce.Do(func() {
 		c.persistResume()
+		if c.releaseAwake != nil {
+			c.releaseAwake()
+		}
 		err = c.srv.Shutdown(ctx)
 		if c.tmpDir != "" {
 			_ = os.RemoveAll(c.tmpDir)
@@ -343,6 +347,9 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		tmpDir:        tmpDir,
 		resume:        a.resume,
 		resumePath:    abs,
+		// Hold an idle-sleep assertion so a sleeping display doesn't stall the
+		// stream; Close releases it. (See inhibitSleep.)
+		releaseAwake: inhibitSleep(),
 	}
 	if build != nil {
 		c.ssOffset = startOffset // transcode stream starts at this absolute offset
