@@ -22,6 +22,12 @@ that go2tv just shrugs at. No browser, no app, no cables. One binary.
 brew install juliocesar/tap/movcaster
 ```
 
+movcaster is distributed as a cask, so upgrade it with:
+
+```sh
+brew upgrade --cask movcaster
+```
+
 **Go** (if you have the toolchain):
 
 ```sh
