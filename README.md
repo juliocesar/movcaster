@@ -25,10 +25,13 @@ in the folder when one ends, and casts a [playlist](#playlists) of files in orde
 brew install juliocesar/tap/movcaster
 ```
 
-movcaster is distributed as a cask, so upgrade it with:
+movcaster is distributed as a cask. To upgrade, refresh the tap first, then
+upgrade — without `brew update` the tap metadata is stale and the upgrade is a
+no-op (note: `brew update movcaster` is *not* a thing — `update` takes no package
+name; use `upgrade` to bump a package):
 
 ```sh
-brew upgrade --cask movcaster
+brew update && brew upgrade --cask movcaster
 ```
 
 **Go** (if you have the toolchain):
