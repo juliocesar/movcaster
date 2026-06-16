@@ -12,6 +12,9 @@ renderer (built for an LG webOS TV) over wifi, with **soft** *and* **burned-in**
 subtitle support — including the bitmap subtitle tracks (VobSub/PGS/`dvd_subtitle`)
 that go2tv just shrugs at. No browser, no app, no cables. One binary.
 
+Binge-friendly, too: it [auto-plays the next episode](#next-episode-automatically)
+in the folder when one ends, and casts a [playlist](#playlists) of files in order.
+
 ![movcaster casting an .mkv with burned-in subtitles, showing the TUI progress bar and controls](docs/screenshot.png)
 
 ## Install
@@ -81,6 +84,13 @@ movcaster --burn Movie.mkv
 
 # Silence, please — no subtitles at all:
 movcaster --no-subs Movie.mkv
+
+# Binge a season: when an episode ends, the next one in the folder auto-plays
+# (press n to skip ahead, --no-next to turn it off):
+movcaster "Hannibal S01E01.mkv"
+
+# Got a specific lineup? List the files and play them top to bottom:
+movcaster --playlist tonight.txt
 ```
 
 The first device you cast to is remembered (`~/.config/movcaster/config.json`),
@@ -91,7 +101,7 @@ shuffles its DLNA port around.
 
 Once it's playing you get a little control panel:
 
-`space` play/pause · `←/→` seek 10s · `↑/↓` volume · `m` mute · `q` quit
+`space` play/pause · `←/→` seek 10s · `↑/↓` volume · `m` mute · `n` next episode · `q` quit
 
 ## All the flags
 
@@ -107,6 +117,8 @@ movcaster <file> --soft            force soft subs (errors on bitmap tracks)
 movcaster <file> --mux-soft        remux a bitmap track as soft (experimental)
 movcaster <file> --no-subs         cast without subtitles
 movcaster <file> --transcode       force a codec-compatibility transcode
+movcaster <file> --no-next         don't auto-play the next episode when one ends
+movcaster --playlist list.txt      cast each file in a playlist, in order
 ```
 
 ## How subtitles are chosen
@@ -131,6 +143,39 @@ saved per file (by absolute path) in `~/.movcaster/playback_index` when playback
 stops or you quit. Finished something? It's cleared automatically, so a rewatch
 starts from the top.
 
+## Next episode, automatically
+
+Casting a TV episode? When it ends, movcaster looks in the same folder for the
+next episode of the same show and casts it — so a season just keeps playing.
+It reads the season/episode out of the filenames (`Hannibal S01E01.mkv` →
+`Hannibal S01E02.mkv`, tolerating different spacing and casing) and only advances
+within the same show, so it never wanders off into an unrelated movie sitting in
+the same folder. Press `n` to jump to the next episode early, or pass `--no-next`
+to switch the whole thing off. A standalone movie with no episode number simply
+plays and stops.
+
+## Playlists
+
+Have a specific lineup in mind? Drop the paths in a text file, one per line, and
+cast the lot:
+
+```
+movcaster --playlist tonight.txt
+```
+
+```text
+# tonight.txt — blank lines and # comments are ignored
+/Volumes/media/Hannibal/S01E01.mkv
+/Volumes/media/Hannibal/S01E02.mkv
+shorts/interlude.mp4          # relative paths resolve from where you run movcaster
+```
+
+It plays them top to bottom; `n` skips to the next entry, `q` stops. Absolute
+paths are used as-is, relative paths resolve against the current directory, and a
+line pointing at a file that isn't there is skipped with a warning rather than
+derailing the rest of the list. (Directory auto-advance is off in playlist mode —
+the list is the running order.)
+
 ## Seeking
 
 Direct-play files seek natively via HTTP byte ranges. During a transcode (burn-in
@@ -154,4 +199,6 @@ internal/transcode       codec-compatibility transcode args
 internal/tui             bubbletea view layer
 internal/config          remembers the last device
 internal/resume          remembers playback position per file (~/.movcaster)
+internal/nextep          finds the next episode in the directory (auto-advance)
+internal/playlist        parses a playlist file (one video path per line)
 ```

@@ -89,6 +89,61 @@ func newTestProgress() progress.Model {
 	return progress.New(progress.WithWidth(20))
 }
 
+func TestEndOfMediaAdvances(t *testing.T) {
+	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress()}
+
+	// Play through to near the end.
+	mi, _ := m.Update(posMsg{pos: 90 * time.Second, dur: 100 * time.Second, state: "PLAYING"})
+	m = mi.(model)
+	if !m.everPlayed || m.maxProgress != 90*time.Second {
+		t.Fatalf("everPlayed=%v maxProgress=%v", m.everPlayed, m.maxProgress)
+	}
+
+	// The TV stops near the end (and may reset its reported position to 0).
+	mi, cmd := m.Update(posMsg{pos: 0, dur: 100 * time.Second, state: "STOPPED"})
+	m = mi.(model)
+	if cmd == nil {
+		t.Fatal("end-of-media did not return a quit command")
+	}
+	if m.outcome != OutcomeEnded || !m.quitting {
+		t.Fatalf("outcome=%v quitting=%v, want Ended/true", m.outcome, m.quitting)
+	}
+}
+
+func TestStoppedBeforePlayingDoesNotEnd(t *testing.T) {
+	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress()}
+	// A STOPPED state before anything ever played (startup) must not advance.
+	mi, cmd := m.Update(posMsg{pos: 0, dur: 100 * time.Second, state: "STOPPED"})
+	m = mi.(model)
+	if cmd != nil || m.outcome != OutcomeQuit || m.quitting {
+		t.Fatalf("startup STOPPED ended prematurely: outcome=%v quitting=%v", m.outcome, m.quitting)
+	}
+}
+
+func TestEarlyStopDoesNotEnd(t *testing.T) {
+	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress()}
+	// Played only a little, then stopped far from the end: not a natural end.
+	mi, _ := m.Update(posMsg{pos: 10 * time.Second, dur: 100 * time.Second, state: "PLAYING"})
+	m = mi.(model)
+	mi, cmd := m.Update(posMsg{pos: 10 * time.Second, dur: 100 * time.Second, state: "STOPPED"})
+	m = mi.(model)
+	if cmd != nil || m.outcome != OutcomeQuit {
+		t.Fatalf("early stop wrongly treated as end: outcome=%v", m.outcome)
+	}
+}
+
+func TestNextKey(t *testing.T) {
+	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress()}
+	mi, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = mi.(model)
+	if cmd == nil {
+		t.Fatal("n key returned no command")
+	}
+	if m.outcome != OutcomeNext || !m.quitting {
+		t.Fatalf("outcome=%v quitting=%v, want Next/true", m.outcome, m.quitting)
+	}
+}
+
 func TestViewRendersState(t *testing.T) {
 	m := model{
 		title:   "Movie.mkv",

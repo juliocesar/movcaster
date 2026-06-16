@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/huin/goupnp v1.3.0
+	github.com/razsteinmetz/go-ptn v1.0.0
 )
 
 require (

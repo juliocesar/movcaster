@@ -11,9 +11,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/juliocesar/movcaster/internal/core"
+	"github.com/juliocesar/movcaster/internal/nextep"
+	"github.com/juliocesar/movcaster/internal/playlist"
 	"github.com/juliocesar/movcaster/internal/resume"
 	"github.com/juliocesar/movcaster/internal/tui"
 )
@@ -35,6 +38,8 @@ func main() {
 		muxSoft  = flag.Bool("mux-soft", false, "remux a bitmap track as soft instead of burning (experimental; toggle on TV)")
 		tcode    = flag.Bool("transcode", false, "force a codec-compatibility transcode")
 		info     = flag.Bool("info", false, "probe the file, print streams and the subtitle decision, then exit")
+		noNext   = flag.Bool("no-next", false, "do not auto-play the next episode in the directory when one ends")
+		plist    = flag.String("playlist", "", "cast a playlist file (one video path per line; # comments allowed)")
 	)
 	flag.Usage = usage
 	flag.Parse()
@@ -58,13 +63,10 @@ func main() {
 		return
 	}
 
-	args := flag.Args()
-	if len(args) != 1 {
-		usage()
-		os.Exit(2)
-	}
-	req := core.CastRequest{
-		File:           args[0],
+	// Subtitle/codec options apply to every file we cast (the sidecar is the one
+	// exception: it's file-specific, so it's only attached to the first file and
+	// cleared when advancing).
+	base := core.CastRequest{
 		Target:         *target,
 		ForceTranscode: *tcode,
 		Subtitle: core.SubtitleOptions{
@@ -76,11 +78,29 @@ func main() {
 			TrackIndex: *subTrack,
 		},
 	}
+
+	if *plist != "" {
+		if len(flag.Args()) != 0 {
+			fmt.Fprintln(os.Stderr, "movcaster: --playlist takes the file list from the playlist; don't also pass a file argument")
+			os.Exit(2)
+		}
+		fail(runPlaylist(app, base, *plist))
+		return
+	}
+
+	args := flag.Args()
+	if len(args) != 1 {
+		usage()
+		os.Exit(2)
+	}
+	req := base
+	req.File = args[0]
 	if *info {
 		fail(runInfo(app, req))
 		return
 	}
-	fail(runCast(app, req))
+	// Default mode: advance to the next episode in the same directory.
+	fail(runCast(app, req, nextEpisode, !*noNext))
 }
 
 // report renders a core.Event to the terminal: Info to stdout, Warn to stderr
@@ -100,6 +120,7 @@ func usage() {
 Usage:
   movcaster -l                       list renderers
   movcaster <file>                   cast (auto subs, auto codec fallback)
+  movcaster --playlist list.txt      cast a playlist (one video path per line)
   movcaster <file> -t TARGET         target a device (IP, IP:port, or device URL)
   movcaster <file> --info            show streams + chosen subtitle strategy
   movcaster <file> --sub foo.srt     force an explicit soft subtitle
@@ -109,12 +130,23 @@ Usage:
   movcaster <file> --mux-soft        remux a bitmap track as soft (experimental)
   movcaster <file> --no-subs         cast without subtitles
   movcaster <file> --transcode       force a codec-compatibility transcode
+  movcaster <file> --no-next         do not auto-play the next episode
+  movcaster --playlist list.txt      cast each file listed, in order
+
+Playlists: a plain text file with one video path per line (blank lines and #
+comments ignored). Absolute paths are used as-is; relative paths resolve against
+the current directory. The list plays in order; n skips to the next entry.
 
 Subtitles: a sidecar .srt/.vtt is auto-detected and sent as soft subs; embedded
 text tracks are extracted to soft; bitmap tracks (PGS/VobSub/dvd_subtitle) are
 burned in on the fly. The chosen device is remembered for next time.
 
-Controls (TUI): space play/pause, left/right seek, up/down volume, m mute, q quit.
+Next episode: when a file ends, the next episode in the same directory (same
+show, next season/episode) is detected and cast automatically. Press n to skip
+to it manually, or pass --no-next to disable the automatic advance.
+
+Controls (TUI): space play/pause, left/right seek, up/down volume, m mute,
+n next episode, q quit.
 `)
 }
 
@@ -170,17 +202,101 @@ func runInfo(app *core.App, req core.CastRequest) error {
 	return nil
 }
 
-func runCast(app *core.App, req core.CastRequest) error {
-	cast, _, err := app.Start(context.Background(), req)
+// nextProvider yields the request to cast after the current one. ok is false when
+// the sequence is exhausted. It backs both playback modes: directory episode
+// detection and an explicit playlist.
+type nextProvider func(current core.CastRequest) (core.CastRequest, bool)
+
+// nextEpisode advances to the next episode of the same show in the current file's
+// directory (see internal/nextep), carrying the subtitle/codec options forward.
+func nextEpisode(cur core.CastRequest) (core.CastRequest, bool) {
+	n, ok, _ := nextep.Find(cur.File)
+	if !ok {
+		return core.CastRequest{}, false
+	}
+	cur.File = n
+	cur.Subtitle.Sidecar = "" // sidecar is file-specific; let auto-detect re-find it
+	return cur, true
+}
+
+// runCast casts req.File and, when the file ends (or the user presses "n"),
+// advances via next until the sequence is exhausted or the user quits. autoNext
+// gates only the automatic on-end advance; an explicit "n" always advances if
+// there is a next item.
+func runCast(app *core.App, req core.CastRequest, next nextProvider, autoNext bool) error {
+	ctx := context.Background()
+	for {
+		cast, _, err := app.Start(ctx, req)
+		if err != nil {
+			return err
+		}
+		outcome, runErr := tui.Run(cast, tui.Options{
+			Title:     cast.Title(),
+			Device:    cast.Device(),
+			SubInfo:   cast.SubInfo(),
+			HasVolume: cast.HasVolume(),
+		})
+		cast.Close(ctx)
+		if runErr != nil {
+			return runErr
+		}
+
+		advance := outcome == tui.OutcomeNext ||
+			(outcome == tui.OutcomeEnded && autoNext)
+		if !advance {
+			return nil
+		}
+
+		nreq, ok := next(req)
+		if !ok {
+			return nil // sequence exhausted
+		}
+		fmt.Println("Up next:", filepath.Base(nreq.File))
+		req = nreq
+	}
+}
+
+// runPlaylist casts the entries of a playlist file in order. Missing or
+// non-video entries are skipped with a warning rather than aborting the list.
+// On-end advance is always enabled here (the playlist defines the sequence);
+// --no-next only applies to directory episode detection.
+func runPlaylist(app *core.App, base core.CastRequest, path string) error {
+	entries, err := playlist.Load(path)
 	if err != nil {
 		return err
 	}
-	defer cast.Close(context.Background())
+	files := existingFiles(entries)
+	if len(files) == 0 {
+		return fmt.Errorf("playlist %q has no playable files", path)
+	}
 
-	return tui.Run(cast, tui.Options{
-		Title:     cast.Title(),
-		Device:    cast.Device(),
-		SubInfo:   cast.SubInfo(),
-		HasVolume: cast.HasVolume(),
-	})
+	i := 0
+	next := func(core.CastRequest) (core.CastRequest, bool) {
+		if i >= len(files) {
+			return core.CastRequest{}, false
+		}
+		r := base
+		r.File = files[i]
+		r.Subtitle.Sidecar = "" // sidecar applies only to a single file
+		i++
+		return r, true
+	}
+
+	first, _ := next(core.CastRequest{}) // len(files) > 0, so this is non-empty
+	return runCast(app, first, next, true)
+}
+
+// existingFiles drops entries that don't exist or aren't regular files, warning
+// about each so a typo in the playlist doesn't silently disappear.
+func existingFiles(entries []string) []string {
+	out := entries[:0]
+	for _, e := range entries {
+		fi, err := os.Stat(e)
+		if err != nil || fi.IsDir() {
+			fmt.Fprintln(os.Stderr, "movcaster: skipping playlist entry:", e)
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }

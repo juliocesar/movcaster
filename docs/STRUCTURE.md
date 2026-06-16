@@ -6,7 +6,8 @@ binary; shells out to `ffmpeg`/`ffprobe`. No GUI/web. See `plans/MOVCASTER_PLAN.
 for rationale and `README.md` for user-facing usage.
 
 Module: `github.com/juliocesar/movcaster` · Go 1.26 · deps: `huin/goupnp` (DLNA SOAP),
-`charmbracelet/bubbletea|lipgloss|bubbles` (TUI).
+`charmbracelet/bubbletea|lipgloss|bubbles` (TUI), `razsteinmetz/go-ptn`
+(filename episode parsing for auto-advance).
 
 ---
 
@@ -45,14 +46,24 @@ then `Preparation.DescribeStreams()` / `DescribeStrategy()` render the text.
 Thin CLI client: flag parsing + map to `core.CastRequest` + render events. No
 orchestration logic.
 - `main()` — flags: `-l -t -sub -no-subs -burn -soft -sub-track -mux-soft -transcode -info`.
-  Builds one `core.App` with an `OnEvent` reporter.
+  Builds one `core.App` with an `OnEvent` reporter. `-no-next` disables auto-advance.
 - `report(Event)` — `Info`→stdout, `Warn`→stderr with the `movcaster:` prefix. This is
   the one place core's progress lines become terminal output.
 - `runList(app)` — `-l`: `app.ListDevices` + print.
 - `runInfo(app, req)` — `--info`: `app.Prepare` then print `DescribeStreams`/`DescribeStrategy`.
   ProbeErr is fatal (matches old behavior: aborts before printing); DecideErr prints
   streams then errors.
-- `runCast(app, req)` — `app.Start` → `tui.Run(cast, …)` → `cast.Close` on quit.
+- `runCast(app, req, next, autoNext)` — loop: `app.Start` → `tui.Run(cast, …)` →
+  `cast.Close`. On `OutcomeEnded` (with `autoNext`) or `OutcomeNext` (the `n` key),
+  call the `nextProvider` for the next request and cast it; otherwise return. Prints
+  "Up next: <base>" between items.
+- `nextProvider`/`nextEpisode` — `next(cur) (CastRequest, bool)` abstracts "what plays
+  next". `nextEpisode` uses `nextep.Find` (same-dir episode); `-no-next` clears
+  `autoNext` in this mode. Both providers carry subtitle/codec opts forward and clear
+  the file-specific `Subtitle.Sidecar`.
+- `runPlaylist(app, base, path)` — `-playlist`: `playlist.Load` → `existingFiles`
+  (skip+warn missing/dir entries) → an index-closure `nextProvider` over the list,
+  then `runCast(..., autoNext=true)` (a playlist always advances on end).
 
 ### `internal/core` — UI-agnostic orchestration (the reusable API)
 One import exposes everything a front-end needs. No UI toolkit, no `fmt.Println`;
@@ -148,7 +159,14 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 ### `internal/tui` — bubbletea view (thin)
 - `Controller` interface = the playback surface (`*core.Cast` implements it; the
   assertion in tui still references `*renderer.Renderer`, which also satisfies it).
-- `Run(ctrl, Options{Title,Device,SubInfo,HasVolume})`. Elm loop: `model.Init/Update/View`.
+- `Run(ctrl, Options{Title,Device,SubInfo,HasVolume}) → (Outcome, error)`. Elm loop:
+  `model.Init/Update/View`. `Outcome` = `OutcomeQuit | OutcomeEnded | OutcomeNext`
+  (read off the final model) tells `main` whether to advance to the next episode.
+- End-of-media: a `posMsg` with a stopped state (`STOPPED`/`NO_MEDIA_PRESENT`), after
+  `everPlayed`, with `maxProgress` within `endGuard` (12s) of `dur`, sets `OutcomeEnded`
+  and quits. `maxProgress` (furthest pos seen) is used because the TV may zero its
+  reported position on a natural stop. The `seeking` gate keeps a mid-seek stop from
+  counting. `n` sets `OutcomeNext` (Stop→Quit, like `q`).
 - Polling: `tickCmd` every 1s → `pollCmd` (Position+TransportState). **Skipped while `seeking`**
   to avoid SOAP contention with a seek-restart.
 - Seek debounce: arrow → `armSeek` moves displayed target + bumps `seekGen` + arms 1s `seekFireMsg`;
@@ -168,6 +186,26 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   `core.Start` reads it (see `resumeOffset`: skips <5s or within 30s of the end) and starts
   a transcode at the saved offset / seeks a direct-play file after Play. `core.Cast` caches
   the last polled position and `Close` persists it (or clears it once finished).
+
+### `internal/nextep` — next-episode detection (auto-advance feature)
+- `Find(currentPath) (next string, ok bool, err error)` — within the current file's
+  directory, returns the next episode of the *same show*. Parses season/episode from
+  filenames via `github.com/middelink/go-parse-torrent-name`; picks the smallest
+  `(season, episode)` strictly greater than the current's (handles E+1, gaps, and
+  season rollover). Parsing via `go-ptn` (port of parse-torrent-title) handles the
+  inexact cases: `SxxEyy`, `1x03`, episode-title suffixes, scene tags, varied
+  spacing/case. `ok=false` when the current file has no episode number (e.g. a
+  standalone movie) or no same-show successor exists. Title guard: `norm` (lowercase,
+  alphanumeric-only) of the parsed titles must match → never jumps to an unrelated
+  movie, so auto-advance is safe on by default. Only I/O is `os.ReadDir`.
+
+### `internal/playlist` — playlist file parsing
+- `Load(path) ([]string, error)` — reads a plain text playlist (one video path per
+  line). Skips blank lines and `#` comments (covers m3u `#EXTM3U`/`#EXTINF`). Resolves
+  each entry to an absolute path: absolute paths pass through, relative paths resolve
+  against the CWD (`filepath.Abs`), per spec. Errors only on unreadable file or zero
+  entries; existence of referenced files is the caller's concern (`main.existingFiles`
+  skips missing ones so one bad line doesn't abort the list). No deps.
 
 ---
 

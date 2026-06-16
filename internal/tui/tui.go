@@ -16,6 +16,22 @@ import (
 
 const seekStep = 10 * time.Second
 
+// endGuard is how close to the duration the last observed position must be for a
+// STOPPED state to count as a natural end-of-media (rather than an early or
+// mid-transition stop). The poll runs every second and the TV reports the stop a
+// tick or two late, so we allow a small margin.
+const endGuard = 12 * time.Second
+
+// Outcome reports why the TUI loop ended, so the caller can decide whether to
+// advance to the next episode.
+type Outcome int
+
+const (
+	OutcomeQuit  Outcome = iota // user quit (q/ctrl+c)
+	OutcomeEnded                // media played to its end
+	OutcomeNext                 // user asked for the next episode (n)
+)
+
 // Controller is the playback behavior the TUI drives. cast.Session implements it
 // for both direct-play (native seek) and transcode (seek-restart).
 type Controller interface {
@@ -65,6 +81,13 @@ type model struct {
 	width    int
 	lastErr  error
 	quitting bool
+	outcome  Outcome
+
+	// End-of-media detection. everPlayed gates against the STOPPED state the TV
+	// reports before playback begins; maxProgress is the furthest position seen
+	// (the TV may reset its reported position to 0 on a natural stop).
+	everPlayed  bool
+	maxProgress time.Duration
 
 	// Debounced seeking: arrow presses move pendingSeek and (re)arm a timer; the
 	// actual seek is issued only after seekDebounce of no further presses. While
@@ -82,8 +105,9 @@ type Options struct {
 	HasVolume bool
 }
 
-// Run launches the TUI loop. It blocks until the user quits, then returns.
-func Run(ctrl Controller, opts Options) error {
+// Run launches the TUI loop. It blocks until the media ends or the user quits,
+// then returns why it ended so the caller can decide whether to advance.
+func Run(ctrl Controller, opts Options) (Outcome, error) {
 	m := model{
 		ctrl:    ctrl,
 		title:   opts.Title,
@@ -95,8 +119,11 @@ func Run(ctrl Controller, opts Options) error {
 		prog:    progress.New(progress.WithDefaultGradient(), progress.WithWidth(50)),
 	}
 	p := tea.NewProgram(m)
-	_, err := p.Run()
-	return err
+	final, err := p.Run()
+	if fm, ok := final.(model); ok {
+		return fm.outcome, err
+	}
+	return OutcomeQuit, err
 }
 
 func (m model) Init() tea.Cmd {
@@ -173,6 +200,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.seeking { // don't fight the user's pending target
 			m.pos = msg.pos
 		}
+		if msg.state == "PLAYING" {
+			m.everPlayed = true
+		}
+		if msg.pos > m.maxProgress {
+			m.maxProgress = msg.pos
+		}
+		// Natural end: the TV stops after we've seen it play, with the furthest
+		// observed position within endGuard of the duration. The seeking gate on
+		// tickMsg means a mid-seek-restart STOPPED is never sampled here.
+		if m.everPlayed && !m.seeking && isStopped(msg.state) &&
+			m.dur > 0 && m.maxProgress >= m.dur-endGuard {
+			m.outcome = OutcomeEnded
+			m.quitting = true
+			return m, tea.Quit
+		}
 		return m, nil
 
 	case seekFireMsg:
@@ -223,6 +265,13 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
 		m.quitting = true
+		m.outcome = OutcomeQuit
+		stop := actionCmd(m.ctrl.Stop)
+		return m, tea.Sequence(stop, tea.Quit)
+
+	case "n":
+		m.quitting = true
+		m.outcome = OutcomeNext
 		stop := actionCmd(m.ctrl.Stop)
 		return m, tea.Sequence(stop, tea.Quit)
 
@@ -314,13 +363,19 @@ func (m model) View() string {
 	}
 
 	status := fmt.Sprintf("%s   %s%s", stateStyle.Render(prettyState(m.state)), times, vol)
-	hints := dimStyle.Render("space play/pause   ←/→ seek 10s   ↑/↓ volume   m mute   q quit")
+	hints := dimStyle.Render("space play/pause   ←/→ seek 10s   ↑/↓ volume   m mute   n next   q quit")
 
 	out := fmt.Sprintf("\n %s\n %s\n\n %s\n %s\n\n %s\n", header, sub, bar, status, hints)
 	if m.lastErr != nil {
 		out += " " + errStyle.Render("! "+m.lastErr.Error()) + "\n"
 	}
 	return out
+}
+
+// isStopped reports whether a transport state means playback has stopped (the TV
+// uses STOPPED; some report NO_MEDIA_PRESENT once the stream is fully drained).
+func isStopped(state string) bool {
+	return state == "STOPPED" || state == "NO_MEDIA_PRESENT"
 }
 
 func prettyState(s string) string {
