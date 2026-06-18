@@ -121,6 +121,7 @@ movcaster <file> --mux-soft        remux a bitmap track as soft (experimental)
 movcaster <file> --no-subs         cast without subtitles
 movcaster <file> --transcode       force a codec-compatibility transcode
 movcaster <file> --no-next         don't auto-play the next episode when one ends
+movcaster --resume                 continue the last played video
 movcaster --playlist list.txt      cast each file in a playlist, in order
 ```
 
@@ -145,6 +146,11 @@ picks up right where you stopped — no fiddling with the seek bar. Positions ar
 saved per file (by absolute path) in `~/.movcaster/playback_index` when playback
 stops or you quit. Finished something? It's cleared automatically, so a rewatch
 starts from the top.
+
+Don't remember which file you had on? `movcaster --resume` (no file argument)
+picks the most recently played video and continues it. If that file has since
+moved, it falls back to the next most recent. From there it behaves like a normal
+cast, auto-advancing to the next episode on end unless you pass `--no-next`.
 
 ## Next episode, automatically
 

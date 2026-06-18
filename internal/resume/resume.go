@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -89,6 +90,31 @@ func (s *Store) Set(absPath string, pos time.Duration) error {
 		UpdatedAt:       time.Now().UTC().Format(time.RFC3339),
 	}
 	return s.save(m)
+}
+
+// Recent returns the saved file paths ordered newest-first by UpdatedAt. The
+// most recently played still-in-progress video is therefore Recent()[0] (entries
+// watched to the end are Cleared). An UpdatedAt that fails to parse sorts last so
+// a malformed row can't break selection. Returns an empty slice on an empty index.
+func (s *Store) Recent() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.load()
+	paths := make([]string, 0, len(m))
+	for p := range m {
+		paths = append(paths, p)
+	}
+	parse := func(p string) time.Time {
+		t, err := time.Parse(time.RFC3339, m[p].UpdatedAt)
+		if err != nil {
+			return time.Time{}
+		}
+		return t
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		return parse(paths[i]).After(parse(paths[j]))
+	})
+	return paths
 }
 
 // Clear removes any record for absPath (e.g. once it has been watched to the end).

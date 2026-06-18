@@ -27,19 +27,20 @@ var version = "dev"
 
 func main() {
 	var (
-		list     = flag.Bool("l", false, "list DLNA renderers on the LAN and exit")
-		showVer  = flag.Bool("version", false, "print version and exit")
-		target   = flag.String("t", "", "target device: IP, IP:port, or device description URL")
-		sub      = flag.String("sub", "", "subtitle file to use as soft subs (.srt/.vtt)")
-		noSubs   = flag.Bool("no-subs", false, "do not send any subtitles")
-		burn     = flag.Bool("burn", false, "burn the selected subtitle track into the video")
-		soft     = flag.Bool("soft", false, "force soft subs (errors if the track is bitmap)")
-		subTrack = flag.Int("sub-track", -1, "embedded subtitle track index to use (0-based)")
-		muxSoft  = flag.Bool("mux-soft", false, "remux a bitmap track as soft instead of burning (experimental; toggle on TV)")
-		tcode    = flag.Bool("transcode", false, "force a codec-compatibility transcode")
-		info     = flag.Bool("info", false, "probe the file, print streams and the subtitle decision, then exit")
-		noNext   = flag.Bool("no-next", false, "do not auto-play the next episode in the directory when one ends")
-		plist    = flag.String("playlist", "", "cast a playlist file (one video path per line; # comments allowed)")
+		list       = flag.Bool("l", false, "list DLNA renderers on the LAN and exit")
+		showVer    = flag.Bool("version", false, "print version and exit")
+		target     = flag.String("t", "", "target device: IP, IP:port, or device description URL")
+		sub        = flag.String("sub", "", "subtitle file to use as soft subs (.srt/.vtt)")
+		noSubs     = flag.Bool("no-subs", false, "do not send any subtitles")
+		burn       = flag.Bool("burn", false, "burn the selected subtitle track into the video")
+		soft       = flag.Bool("soft", false, "force soft subs (errors if the track is bitmap)")
+		subTrack   = flag.Int("sub-track", -1, "embedded subtitle track index to use (0-based)")
+		muxSoft    = flag.Bool("mux-soft", false, "remux a bitmap track as soft instead of burning (experimental; toggle on TV)")
+		tcode      = flag.Bool("transcode", false, "force a codec-compatibility transcode")
+		info       = flag.Bool("info", false, "probe the file, print streams and the subtitle decision, then exit")
+		noNext     = flag.Bool("no-next", false, "do not auto-play the next episode in the directory when one ends")
+		plist      = flag.String("playlist", "", "cast a playlist file (one video path per line; # comments allowed)")
+		resumeLast = flag.Bool("resume", false, "continue the last played video (no file argument)")
 	)
 	flag.Usage = usage
 	flag.Parse()
@@ -51,7 +52,8 @@ func main() {
 
 	// Ensure ~/.movcaster + playback_index exist on every run, and enable resume.
 	opts := core.Options{OnEvent: report}
-	if rs, err := resume.New(); err != nil {
+	rs, err := resume.New()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "movcaster: resume disabled:", err)
 	} else {
 		opts.Resume = rs
@@ -84,7 +86,28 @@ func main() {
 			fmt.Fprintln(os.Stderr, "movcaster: --playlist takes the file list from the playlist; don't also pass a file argument")
 			os.Exit(2)
 		}
+		if *resumeLast {
+			fmt.Fprintln(os.Stderr, "movcaster: --resume and --playlist are mutually exclusive")
+			os.Exit(2)
+		}
 		fail(runPlaylist(app, base, *plist))
+		return
+	}
+
+	if *resumeLast {
+		if len(flag.Args()) != 0 {
+			fmt.Fprintln(os.Stderr, "movcaster: --resume continues the last played video; don't also pass a file argument")
+			os.Exit(2)
+		}
+		if rs == nil {
+			fail(fmt.Errorf("resume is disabled, cannot continue the last video"))
+		}
+		path, err := resumeFile(rs)
+		fail(err)
+		req := base
+		req.File = path
+		fmt.Println("Resuming:", filepath.Base(path))
+		fail(runCast(app, req, nextEpisode, !*noNext))
 		return
 	}
 
@@ -120,7 +143,7 @@ func usage() {
 Usage:
   movcaster -l                       list renderers
   movcaster <file>                   cast (auto subs, auto codec fallback)
-  movcaster --playlist list.txt      cast a playlist (one video path per line)
+  movcaster --resume                 continue the last played video
   movcaster <file> -t TARGET         target a device (IP, IP:port, or device URL)
   movcaster <file> --info            show streams + chosen subtitle strategy
   movcaster <file> --sub foo.srt     force an explicit soft subtitle
@@ -140,6 +163,10 @@ the current directory. The list plays in order; n skips to the next entry.
 Subtitles: a sidecar .srt/.vtt is auto-detected and sent as soft subs; embedded
 text tracks are extracted to soft; bitmap tracks (PGS/VobSub/dvd_subtitle) are
 burned in on the fly. The chosen device is remembered for next time.
+
+Resume: playback positions are remembered per file; re-casting a file picks up
+where you stopped. --resume (no file argument) continues the most recently played
+video, then auto-advances like a normal cast unless --no-next is given.
 
 Next episode: when a file ends, the next episode in the same directory (same
 show, next season/episode) is detected and cast automatically. Press n to skip
@@ -284,6 +311,19 @@ func runPlaylist(app *core.App, base core.CastRequest, path string) error {
 
 	first, _ := next(core.CastRequest{}) // len(files) > 0, so this is non-empty
 	return runCast(app, first, next, true)
+}
+
+// resumeFile returns the newest still-existing entry in the resume index. It
+// walks newest-first so a since-deleted file doesn't dead-end the resume; each
+// skipped entry is warned about. Errors when nothing playable remains.
+func resumeFile(rs *resume.Store) (string, error) {
+	for _, p := range rs.Recent() {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p, nil
+		}
+		fmt.Fprintln(os.Stderr, "movcaster: skipping missing resume entry:", p)
+	}
+	return "", fmt.Errorf("no recently played video to resume")
 }
 
 // existingFiles drops entries that don't exist or aren't regular files, warning

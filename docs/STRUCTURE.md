@@ -47,6 +47,9 @@ Thin CLI client: flag parsing + map to `core.CastRequest` + render events. No
 orchestration logic.
 - `main()` — flags: `-l -t -sub -no-subs -burn -soft -sub-track -mux-soft -transcode -info`.
   Builds one `core.App` with an `OnEvent` reporter. `-no-next` disables auto-advance.
+  `-resume` (no file arg) casts the last played video via `resumeFile` (newest still-existing
+  entry from `resume.Store.Recent()`, skipping missing ones), then runs like a normal cast;
+  mutually exclusive with a file arg and `--playlist`.
 - `report(Event)` — `Info`→stdout, `Warn`→stderr with the `movcaster:` prefix. This is
   the one place core's progress lines become terminal output.
 - `runList(app)` — `-l`: `app.ListDevices` + print.
@@ -182,6 +185,9 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 - `Store` over `~/.movcaster/playback_index` (JSON object keyed by absolute file path:
   `{position_seconds, updated_at}`). `New()` creates the dir + an empty `{}` index on
   construction (so they exist on every run); `Get/Set/Clear` load+rewrite the whole tiny file.
+  `Recent()` returns the keys newest-first by `updated_at` (unparseable timestamps sort
+  last) — backs `main`'s `--resume`; since finished files are `Clear`ed, `Recent()[0]` is
+  the last in-progress video.
 - Wired by `main` and injected via `core.Options.Resume` (nil in tests → resume disabled).
   `core.Start` reads it (see `resumeOffset`: skips <5s or within 30s of the end) and starts
   a transcode at the saved offset / seeks a direct-play file after Play. `core.Cast` caches
