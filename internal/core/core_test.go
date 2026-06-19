@@ -50,11 +50,25 @@ type fakeRenderer struct {
 	pos, dur time.Duration
 	state    string
 	hasVol   bool
+
+	// setMediaErrs is consumed front-to-back, one entry per SetMedia call, to
+	// simulate a TV that rejects the URI until its transport state clears.
+	setMediaErrs []error
+
+	// stateSeq is consumed front-to-back by TransportState (falling back to
+	// `state`), to simulate a TV that lingers in TRANSITIONING after a Stop.
+	stateSeq   []string
+	stateCalls int
 }
 
 func (r *fakeRenderer) SetMedia(_ context.Context, m renderer.Media) error {
 	r.calls = append(r.calls, "SetMedia")
 	r.media = m
+	if len(r.setMediaErrs) > 0 {
+		err := r.setMediaErrs[0]
+		r.setMediaErrs = r.setMediaErrs[1:]
+		return err
+	}
 	return nil
 }
 func (r *fakeRenderer) Play(context.Context) error  { r.calls = append(r.calls, "Play"); return nil }
@@ -68,11 +82,19 @@ func (r *fakeRenderer) Seek(_ context.Context, p time.Duration) error {
 func (r *fakeRenderer) Position(context.Context) (time.Duration, time.Duration, error) {
 	return r.pos, r.dur, nil
 }
-func (r *fakeRenderer) TransportState(context.Context) (string, error) { return r.state, nil }
-func (r *fakeRenderer) HasVolume() bool                                { return r.hasVol }
-func (r *fakeRenderer) Volume(context.Context) (int, error)            { return 0, nil }
-func (r *fakeRenderer) SetVolume(context.Context, int) error           { return nil }
-func (r *fakeRenderer) Mute(context.Context, bool) error               { return nil }
+func (r *fakeRenderer) TransportState(context.Context) (string, error) {
+	r.stateCalls++
+	if len(r.stateSeq) > 0 {
+		s := r.stateSeq[0]
+		r.stateSeq = r.stateSeq[1:]
+		return s, nil
+	}
+	return r.state, nil
+}
+func (r *fakeRenderer) HasVolume() bool                      { return r.hasVol }
+func (r *fakeRenderer) Volume(context.Context) (int, error)  { return 0, nil }
+func (r *fakeRenderer) SetVolume(context.Context, int) error { return nil }
+func (r *fakeRenderer) Mute(context.Context, bool) error     { return nil }
 
 type fakeServer struct {
 	calls         []string
@@ -242,6 +264,49 @@ func TestSeekTranscodeRestartSequence(t *testing.T) {
 	}
 	if c.ssOffset != 90*time.Second {
 		t.Fatalf("ssOffset = %v, want 90s", c.ssOffset)
+	}
+}
+
+// A fresh cast must clear the TV's transport state (Stop) before pointing it at
+// new media, then Play — the sequence that avoids 701 "Transition not available".
+func TestStartPlaybackStopsThenSetsAndPlays(t *testing.T) {
+	r := &fakeRenderer{}
+	if err := startPlayback(context.Background(), r, renderer.Media{URL: "http://test/media.mp4"}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Stop", "SetMedia", "Play"}
+	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", r.calls, want)
+	}
+}
+
+// A 701 on the first SetAVTransportURI must be retried (after the Stop has had a
+// chance to clear the TV's state), not surfaced as a hard failure.
+func TestStartPlaybackRetriesTransientSetMedia(t *testing.T) {
+	r := &fakeRenderer{setMediaErrs: []error{context.DeadlineExceeded}} // first SetMedia fails, second succeeds
+	if err := startPlayback(context.Background(), r, renderer.Media{}); err != nil {
+		t.Fatalf("expected retry to recover, got %v", err)
+	}
+	want := []string{"Stop", "SetMedia", "SetMedia", "Play"}
+	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", r.calls, want)
+	}
+}
+
+// startPlayback must not issue SetAVTransportURI until the TV has left the
+// transitioning state — firing too early is what triggers 701. It should poll
+// TransportState past the LG_TRANSITIONING readings before setting the URI.
+func TestStartPlaybackWaitsForTransitionToSettle(t *testing.T) {
+	r := &fakeRenderer{stateSeq: []string{"LG_TRANSITIONING", "LG_TRANSITIONING", "STOPPED"}}
+	if err := startPlayback(context.Background(), r, renderer.Media{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.stateCalls < 3 {
+		t.Fatalf("expected to poll TransportState until settled, polled %d time(s)", r.stateCalls)
+	}
+	want := []string{"Stop", "SetMedia", "Play"}
+	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", r.calls, want)
 	}
 }
 

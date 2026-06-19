@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -312,17 +313,12 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		}
 	}
 
-	setCtx, setCancel := context.WithTimeout(ctx, 10*time.Second)
+	setCtx, setCancel := context.WithTimeout(ctx, 45*time.Second)
 	defer setCancel()
-	if err := rend.SetMedia(setCtx, media); err != nil {
+	if err := startPlayback(setCtx, rend, media); err != nil {
 		_ = srv.Shutdown(context.Background())
 		_ = os.RemoveAll(tmpDir)
-		return nil, nil, fmt.Errorf("SetAVTransportURI: %w", err)
-	}
-	if err := rend.Play(setCtx); err != nil {
-		_ = srv.Shutdown(context.Background())
-		_ = os.RemoveAll(tmpDir)
-		return nil, nil, fmt.Errorf("Play: %w", err)
+		return nil, nil, err
 	}
 
 	// Direct-play resume: seek after Play (best-effort; the TV may need a moment
@@ -420,6 +416,56 @@ func (a *App) applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir
 		return label, build, nil
 	}
 	return "", nil, nil
+}
+
+// startPlayback points the TV at media for a fresh cast: it first clears any
+// leftover transport state (best-effort Stop) and waits for the TV to actually
+// leave the transitioning state, then retries the SetAVTransportURI/Play
+// sequence. The Stop + settle matters because a TV mid-transition (left there by
+// a previous cast or another app — webOS reports "LG_TRANSITIONING") rejects a
+// new URI with 701 "Transition not available". Crucially, the TV keeps reporting
+// the transition for a second or two after Stop returns, so we poll its state
+// rather than sleeping a fixed interval; firing SetAVTransportURI too early is
+// exactly what triggers the 701. The retries cover the residual mid-transition
+// flakiness. Mirrors the seek-restart sequence in Seek.
+func startPlayback(ctx context.Context, r RendererControl, media renderer.Media) error {
+	stopCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	_ = r.Stop(stopCtx)
+	cancel()
+	waitTransportSettled(ctx, r, 6*time.Second)
+
+	if err := retrySOAP(ctx, 3, 9*time.Second, func(ic context.Context) error {
+		return r.SetMedia(ic, media)
+	}); err != nil {
+		return fmt.Errorf("SetAVTransportURI: %w", err)
+	}
+	if err := retrySOAP(ctx, 3, 7*time.Second, func(ic context.Context) error {
+		return r.Play(ic)
+	}); err != nil {
+		return fmt.Errorf("Play: %w", err)
+	}
+	return nil
+}
+
+// waitTransportSettled blocks until the renderer reports a non-transitioning
+// transport state (or the budget/ctx elapses). webOS reports "LG_TRANSITIONING"
+// for a beat or two after a Stop, and accepts SetAVTransportURI only once it has
+// left that state. Best-effort: a read error or timeout just returns, letting the
+// retrying caller proceed.
+func waitTransportSettled(ctx context.Context, r RendererControl, budget time.Duration) {
+	wctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	for {
+		sctx, scancel := context.WithTimeout(wctx, 2*time.Second)
+		state, err := r.TransportState(sctx)
+		scancel()
+		if err == nil && !strings.Contains(state, "TRANSITIONING") {
+			return
+		}
+		if !sleepCtx(wctx, 300*time.Millisecond) {
+			return
+		}
+	}
 }
 
 // retrySOAP runs fn up to attempts times, each with its own per-call timeout,
