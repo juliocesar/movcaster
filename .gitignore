@@ -1,3 +1,4 @@
 /movcaster
 *.test
 /dist/
+/tasks/
