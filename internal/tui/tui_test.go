@@ -31,6 +31,130 @@ func (f *fakeCtrl) Volume(context.Context) (int, error)            { return 0, n
 func (f *fakeCtrl) SetVolume(context.Context, int) error           { return nil }
 func (f *fakeCtrl) Mute(context.Context, bool) error               { return nil }
 
+// fakeSubCtrl adds live subtitle switching to fakeCtrl (satisfies SubtitleController).
+type fakeSubCtrl struct {
+	fakeCtrl
+	choices  []string
+	active   int
+	setCalls []int
+	subInfo  string
+}
+
+func (f *fakeSubCtrl) SubtitleChoices() []string { return f.choices }
+func (f *fakeSubCtrl) ActiveSubtitle() int       { return f.active }
+func (f *fakeSubCtrl) SetSubtitle(_ context.Context, idx int) error {
+	f.setCalls = append(f.setCalls, idx)
+	return nil
+}
+func (f *fakeSubCtrl) SubInfo() string { return f.subInfo }
+
+func keyRune(r rune) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}} }
+
+func TestSubMenuOpensOnActive(t *testing.T) {
+	f := &fakeSubCtrl{choices: []string{"A", "B", "Off"}, active: 1}
+	m := model{ctrl: f, prog: newTestProgress()}
+	mi, _ := m.Update(keyRune('s'))
+	m = mi.(model)
+	if !m.subMenuOpen {
+		t.Fatal("s did not open the menu")
+	}
+	if m.subCursor != 1 {
+		t.Fatalf("cursor = %d, want active index 1", m.subCursor)
+	}
+	if len(m.subChoices) != 3 {
+		t.Fatalf("choices = %v", m.subChoices)
+	}
+}
+
+func TestSubMenuPlainControllerDoesNotOpen(t *testing.T) {
+	// fakeCtrl is not a SubtitleController, so s must be a no-op.
+	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress()}
+	mi, _ := m.Update(keyRune('s'))
+	m = mi.(model)
+	if m.subMenuOpen {
+		t.Fatal("menu opened for a controller without subtitle support")
+	}
+}
+
+func TestSubMenuNavigationBounds(t *testing.T) {
+	f := &fakeSubCtrl{choices: []string{"A", "B", "Off"}, active: 0}
+	m := model{ctrl: f, prog: newTestProgress(), subMenuOpen: true, subChoices: f.choices, subCursor: 0}
+
+	// Up at the top stays put.
+	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = mi.(model)
+	if m.subCursor != 0 {
+		t.Fatalf("cursor went above 0: %d", m.subCursor)
+	}
+	// Down moves; down at the bottom clamps.
+	for i := 0; i < 5; i++ {
+		mi, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = mi.(model)
+	}
+	if m.subCursor != 2 {
+		t.Fatalf("cursor = %d, want clamped to 2", m.subCursor)
+	}
+}
+
+func TestSubMenuEnterSwitches(t *testing.T) {
+	f := &fakeSubCtrl{choices: []string{"A", "B", "Off"}, active: 0}
+	m := model{ctrl: f, prog: newTestProgress(), subMenuOpen: true, subChoices: f.choices, subCursor: 2}
+
+	mi, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = mi.(model)
+	if m.subMenuOpen {
+		t.Fatal("menu should close on enter")
+	}
+	if !m.switching {
+		t.Fatal("switching flag not set")
+	}
+	if cmd == nil {
+		t.Fatal("enter returned no switch command")
+	}
+	done := cmd()
+	if _, ok := done.(subDoneMsg); !ok {
+		t.Fatalf("expected subDoneMsg, got %T", done)
+	}
+	if len(f.setCalls) != 1 || f.setCalls[0] != 2 {
+		t.Fatalf("SetSubtitle calls = %v, want [2]", f.setCalls)
+	}
+}
+
+func TestSubDoneRefreshesLabel(t *testing.T) {
+	f := &fakeSubCtrl{subInfo: "soft: movie.srt"}
+	m := model{ctrl: f, prog: newTestProgress(), switching: true, subInfo: "old"}
+	mi, _ := m.Update(subDoneMsg{})
+	m = mi.(model)
+	if m.switching {
+		t.Fatal("switching not cleared")
+	}
+	if m.subInfo != "soft: movie.srt" {
+		t.Fatalf("subInfo = %q, want refreshed", m.subInfo)
+	}
+}
+
+func TestSubMenuEscCloses(t *testing.T) {
+	f := &fakeSubCtrl{choices: []string{"A", "Off"}}
+	m := model{ctrl: f, prog: newTestProgress(), subMenuOpen: true, subChoices: f.choices}
+	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = mi.(model)
+	if m.subMenuOpen {
+		t.Fatal("esc did not close the menu")
+	}
+	if len(f.setCalls) != 0 {
+		t.Fatalf("esc issued a switch: %v", f.setCalls)
+	}
+}
+
+func TestSwitchingGatesPolling(t *testing.T) {
+	m := model{ctrl: &fakeSubCtrl{}, prog: newTestProgress(), switching: true}
+	// A tick while switching re-arms the timer but must not also fire a poll.
+	_, cmd := m.Update(tickMsg(time.Now()))
+	if cmd == nil {
+		t.Fatal("tick should re-arm even while switching")
+	}
+}
+
 func TestSeekDebounce(t *testing.T) {
 	f := &fakeCtrl{}
 	m := model{ctrl: f, pos: 10 * time.Second, dur: 100 * time.Second, prog: newTestProgress()}

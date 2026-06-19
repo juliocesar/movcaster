@@ -104,7 +104,11 @@ shuffles its DLNA port around.
 
 Once it's playing you get a little control panel:
 
-`space` play/pause · `←/→` seek 10s · `↑/↓` volume · `m` mute · `n` next episode · `q` quit
+`space` play/pause · `←/→` seek 10s · `↑/↓` volume · `m` mute · `s` subtitles · `n` next episode · `q` quit
+
+Press `s` to open a subtitle picker: it lists every embedded track, any sidecar
+file, and **Off**. Pick one and movcaster re-points the TV at a freshly built
+stream and resumes where you were (text tracks go soft, bitmap tracks burn in).
 
 ## All the flags
 

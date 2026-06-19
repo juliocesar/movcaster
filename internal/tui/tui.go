@@ -6,6 +6,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
@@ -50,6 +51,17 @@ type Controller interface {
 // Ensure *renderer.Renderer satisfies Controller.
 var _ Controller = (*renderer.Renderer)(nil)
 
+// SubtitleController is the optional capability of live subtitle switching,
+// implemented by *core.Cast. *renderer.Renderer does not implement it, so the
+// picker simply never opens for controllers that lack subtitle support. It is
+// kept separate from Controller so the renderer assertion above still holds.
+type SubtitleController interface {
+	SubtitleChoices() []string
+	ActiveSubtitle() int
+	SetSubtitle(ctx context.Context, idx int) error
+	SubInfo() string
+}
+
 const seekDebounce = time.Second
 
 type tickMsg time.Time
@@ -64,6 +76,9 @@ type errMsg struct{ err error }
 // supersede an older pending one.
 type seekFireMsg struct{ gen int }
 type seekDoneMsg struct{ err error }
+
+// subDoneMsg reports the result of a live subtitle switch.
+type subDoneMsg struct{ err error }
 
 type model struct {
 	ctrl    Controller
@@ -95,6 +110,14 @@ type model struct {
 	seeking     bool
 	pendingSeek time.Duration
 	seekGen     int
+
+	// Live subtitle picker. subMenuOpen shows the overlay; switching gates polling
+	// during the restart (like seeking) so transient transport states aren't
+	// sampled mid-switch.
+	subMenuOpen bool
+	subChoices  []string
+	subCursor   int
+	switching   bool
 }
 
 // Options configure the view.
@@ -188,9 +211,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		// Don't poll mid-seek: concurrent SOAP to the TV's control endpoint while
-		// a seek-restart is in flight is what makes the TV choke and time out.
-		if m.seeking {
+		// Don't poll mid-seek or mid-switch: concurrent SOAP to the TV's control
+		// endpoint while a restart is in flight is what makes the TV choke and time
+		// out (a subtitle switch runs the same Stop->settle->SetURI->Play sequence).
+		if m.seeking || m.switching {
 			return m, tickCmd()
 		}
 		return m, tea.Batch(tickCmd(), m.pollCmd())
@@ -237,6 +261,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case subDoneMsg:
+		m.switching = false
+		if msg.err != nil {
+			m.lastErr = msg.err
+		} else if sc, ok := m.ctrl.(SubtitleController); ok {
+			m.subInfo = sc.SubInfo() // header label reflects the new track
+		}
+		return m, nil
+
 	case volMsg:
 		m.volume = int(msg)
 		return m, nil
@@ -262,12 +295,28 @@ func (m *model) armSeek(target time.Duration) tea.Cmd {
 }
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// While the subtitle picker is open it owns the keyboard.
+	if m.subMenuOpen {
+		return m.handleSubMenuKey(msg)
+	}
+
 	switch msg.String() {
 	case "q", "ctrl+c":
 		m.quitting = true
 		m.outcome = OutcomeQuit
 		stop := actionCmd(m.ctrl.Stop)
 		return m, tea.Sequence(stop, tea.Quit)
+
+	case "s":
+		// Open the subtitle picker if this controller supports switching.
+		if sc, ok := m.ctrl.(SubtitleController); ok {
+			m.subChoices = sc.SubtitleChoices()
+			if len(m.subChoices) > 0 {
+				m.subCursor = sc.ActiveSubtitle()
+				m.subMenuOpen = true
+			}
+		}
+		return m, nil
 
 	case "n":
 		m.quitting = true
@@ -322,6 +371,51 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleSubMenuKey handles keystrokes while the subtitle picker is open. Up/Down
+// (k/j) move the cursor, Enter applies the highlighted choice (kicking off the
+// switch), Esc/s close without changing anything, and q/ctrl+c still quit.
+func (m model) handleSubMenuKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		if m.subCursor > 0 {
+			m.subCursor--
+		}
+		return m, nil
+
+	case "down", "j":
+		if m.subCursor < len(m.subChoices)-1 {
+			m.subCursor++
+		}
+		return m, nil
+
+	case "esc", "s":
+		m.subMenuOpen = false
+		return m, nil
+
+	case "enter":
+		sc, ok := m.ctrl.(SubtitleController)
+		if !ok {
+			m.subMenuOpen = false
+			return m, nil
+		}
+		idx := m.subCursor
+		m.subMenuOpen = false
+		m.switching = true
+		return m, func() tea.Msg {
+			// Generous budget: the switch does several retried SOAP calls.
+			ctx, cancel := withCtx(60 * time.Second)
+			defer cancel()
+			return subDoneMsg{err: sc.SetSubtitle(ctx, idx)}
+		}
+
+	case "q", "ctrl+c":
+		m.quitting = true
+		m.outcome = OutcomeQuit
+		return m, tea.Sequence(actionCmd(m.ctrl.Stop), tea.Quit)
+	}
+	return m, nil // swallow other keys while the menu is open
+}
+
 var (
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
 	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
@@ -352,6 +446,9 @@ func (m model) View() string {
 	if m.seeking {
 		times += "  → seeking…"
 	}
+	if m.switching {
+		times += "  → switching subtitles…"
+	}
 
 	vol := ""
 	if m.hasVol {
@@ -363,13 +460,44 @@ func (m model) View() string {
 	}
 
 	status := fmt.Sprintf("%s   %s%s", stateStyle.Render(prettyState(m.state)), times, vol)
-	hints := dimStyle.Render("space play/pause   ←/→ seek 10s   ↑/↓ volume   m mute   n next   q quit")
+	hints := dimStyle.Render("space play/pause   ←/→ seek 10s   ↑/↓ volume   m mute   s subtitles   n next   q quit")
 
-	out := fmt.Sprintf("\n %s\n %s\n\n %s\n %s\n\n %s\n", header, sub, bar, status, hints)
+	out := fmt.Sprintf("\n %s\n %s\n\n %s\n %s\n", header, sub, bar, status)
+	if m.subMenuOpen {
+		out += "\n" + m.renderSubMenu()
+	}
+	out += "\n " + hints + "\n"
 	if m.lastErr != nil {
 		out += " " + errStyle.Render("! "+m.lastErr.Error()) + "\n"
 	}
 	return out
+}
+
+// renderSubMenu renders the subtitle picker overlay: one row per choice, the
+// cursor marked with ">", and the currently active track tagged.
+func (m model) renderSubMenu() string {
+	active := -1
+	if sc, ok := m.ctrl.(SubtitleController); ok {
+		active = sc.ActiveSubtitle()
+	}
+	var b strings.Builder
+	b.WriteString(" " + dimStyle.Render("Subtitles  (↑/↓ select · enter apply · esc cancel)") + "\n")
+	for i, label := range m.subChoices {
+		row := "    " + label
+		if i == m.subCursor {
+			row = "  > " + label
+		}
+		if i == active {
+			row += "   ● active"
+		}
+		if i == m.subCursor {
+			b.WriteString(stateStyle.Render(row))
+		} else {
+			b.WriteString(dimStyle.Render(row))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // isStopped reports whether a transport state means playback has stopped (the TV

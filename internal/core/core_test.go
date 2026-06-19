@@ -345,14 +345,12 @@ func TestPositionTranscodeAddsOffset(t *testing.T) {
 // --- subtitle application + events ---
 
 func TestApplySubtitlesBurn(t *testing.T) {
-	var events []Event
-	a := New(Options{OnEvent: func(e Event) { events = append(events, e) }})
 	s := &fakeServer{}
 	media := &renderer.Media{Seekable: true, MIME: "video/x-matroska"}
 	track := probe.SubTrack{SubIndex: 1, Codec: "hdmv_pgs_subtitle", Kind: probe.SubBitmap}
 	dec := subs.Decision{Kind: subs.Burn, Track: &track}
 
-	label, build, err := a.applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec)
+	label, build, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,19 +366,14 @@ func TestApplySubtitlesBurn(t *testing.T) {
 	if len(s.transcodeArgs) != 1 {
 		t.Fatalf("expected one SetTranscode, got %d", len(s.transcodeArgs))
 	}
-	if len(events) == 0 || !strings.Contains(events[0].Message, "burning in") {
-		t.Fatalf("expected a 'burning in' event, got %v", events)
-	}
 }
 
 func TestApplySubtitlesSidecar(t *testing.T) {
-	var events []Event
-	a := New(Options{OnEvent: func(e Event) { events = append(events, e) }})
 	s := &fakeServer{}
 	media := &renderer.Media{}
 	dec := subs.Decision{Kind: subs.SoftSidecar, SidecarPath: "/x/movie.srt"}
 
-	label, build, err := a.applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec)
+	label, build, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,15 +392,182 @@ func TestApplySubtitlesSidecar(t *testing.T) {
 }
 
 func TestApplySubtitlesNone(t *testing.T) {
-	a := New(Options{})
 	s := &fakeServer{}
 	media := &renderer.Media{Seekable: true}
-	label, build, err := a.applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), subs.Decision{Kind: subs.None})
+	label, build, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), subs.Decision{Kind: subs.None}, 0)
 	if err != nil || label != "" || build != nil {
 		t.Fatalf("None: label=%q build!=nil=%v err=%v", label, build != nil, err)
 	}
 	if len(s.calls) != 0 {
 		t.Fatalf("None must not touch the server, got %v", s.calls)
+	}
+}
+
+// buildDelivery must be idempotent across mode flips: each call re-establishes a
+// direct-play baseline before applying, so soft -> burn -> off -> soft leaves the
+// server source and media fields consistent every time.
+func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
+	a := New(Options{})
+	s := &fakeServer{}
+	media := &renderer.Media{}
+	info := &probe.MediaInfo{
+		Subtitles: []probe.SubTrack{{SubIndex: 0, Codec: "hdmv_pgs_subtitle", Kind: probe.SubBitmap}},
+	}
+	soft := SubtitleOptions{Sidecar: "/x/movie.srt", TrackIndex: -1}
+	burn := SubtitleOptions{TrackIndex: 0}
+	off := SubtitleOptions{NoSubs: true, TrackIndex: -1}
+
+	assertSoft := func() {
+		_, build, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, soft, false, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if build != nil {
+			t.Fatal("soft must direct-play (build nil)")
+		}
+		if media.SubURL == "" || media.SubType != "srt" {
+			t.Fatalf("soft: subURL=%q type=%q", media.SubURL, media.SubType)
+		}
+		if !media.Seekable || media.MIME != "video/x-matroska" {
+			t.Fatalf("soft: seekable=%v mime=%q (want original)", media.Seekable, media.MIME)
+		}
+	}
+
+	assertSoft()
+
+	// soft -> burn: media flips to non-seekable mp4 with subs cleared, build set.
+	_, build, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, burn, false, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if build == nil {
+		t.Fatal("burn must transcode (build set)")
+	}
+	if media.SubURL != "" {
+		t.Fatalf("burn must clear soft subURL, got %q", media.SubURL)
+	}
+	if media.Seekable || media.MIME != "video/mp4" {
+		t.Fatalf("burn: seekable=%v mime=%q", media.Seekable, media.MIME)
+	}
+
+	// burn -> off: back to a clean direct-play baseline, no subs, no transcode.
+	_, build, err = a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, off, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if build != nil {
+		t.Fatal("off must direct-play (build nil)")
+	}
+	if media.SubURL != "" {
+		t.Fatalf("off must clear subURL, got %q", media.SubURL)
+	}
+	if !media.Seekable || media.MIME != "video/x-matroska" {
+		t.Fatalf("off: seekable=%v mime=%q (want original)", media.Seekable, media.MIME)
+	}
+
+	// off -> soft: returns to the soft state cleanly.
+	assertSoft()
+}
+
+func TestSetSubtitleDirectPlayChoice(t *testing.T) {
+	r := &fakeRenderer{}
+	s := &fakeServer{}
+	a := New(Options{})
+	info := &probe.MediaInfo{
+		Subtitles: []probe.SubTrack{{SubIndex: 0, Codec: "hdmv_pgs_subtitle", Kind: probe.SubBitmap}},
+	}
+	choices := buildSubChoices(info, "/x/movie.srt") // [sidecar, track s:0 (bitmap), off]
+	c := &Cast{
+		r: r, srv: s, app: a, abs: "/x/movie.mkv",
+		info: info, subChoices: choices, lastPos: 50 * time.Second,
+		buildArgs: func(time.Duration) []string { return nil }, // start in some transcode mode
+		ssOffset:  10 * time.Second, activeSub: 1,
+	}
+
+	// Switch to the sidecar (index 0): soft, direct-play.
+	if err := c.SetSubtitle(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Stop", "SetMedia", "Play", "Seek"}
+	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", r.calls, want)
+	}
+	if r.seekedTo != 50*time.Second {
+		t.Fatalf("resumed at %v, want 50s", r.seekedTo)
+	}
+	if c.buildArgs != nil {
+		t.Fatal("direct-play choice must clear buildArgs")
+	}
+	if c.ssOffset != 0 {
+		t.Fatalf("ssOffset = %v, want 0 for direct-play", c.ssOffset)
+	}
+	if c.activeSub != 0 || c.subInfo != "soft: movie.srt" {
+		t.Fatalf("activeSub=%d subInfo=%q", c.activeSub, c.subInfo)
+	}
+}
+
+func TestSetSubtitleTranscodeChoice(t *testing.T) {
+	r := &fakeRenderer{}
+	s := &fakeServer{}
+	a := New(Options{})
+	info := &probe.MediaInfo{
+		Subtitles: []probe.SubTrack{{SubIndex: 0, Codec: "hdmv_pgs_subtitle", Kind: probe.SubBitmap}},
+	}
+	choices := buildSubChoices(info, "/x/movie.srt") // [sidecar, track s:0 (bitmap), off]
+	c := &Cast{
+		r: r, srv: s, app: a, abs: "/x/movie.mkv",
+		info: info, subChoices: choices, lastPos: 50 * time.Second,
+	}
+
+	// Switch to the bitmap track (index 1): burn-in, transcode at the current pos.
+	if err := c.SetSubtitle(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Stop", "SetMedia", "Play"} // no native Seek in transcode mode
+	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", r.calls, want)
+	}
+	if c.buildArgs == nil {
+		t.Fatal("burn choice must set buildArgs")
+	}
+	if c.ssOffset != 50*time.Second {
+		t.Fatalf("ssOffset = %v, want 50s", c.ssOffset)
+	}
+	if c.activeSub != 1 || !strings.Contains(c.subInfo, "burn-in: track 0") {
+		t.Fatalf("activeSub=%d subInfo=%q", c.activeSub, c.subInfo)
+	}
+	if len(s.transcodeArgs) != 1 {
+		t.Fatalf("expected one SetTranscode, got %d", len(s.transcodeArgs))
+	}
+}
+
+func TestSubTrackLabelLanguageName(t *testing.T) {
+	cases := []struct {
+		t    probe.SubTrack
+		want string
+	}{
+		{probe.SubTrack{SubIndex: 0, Language: "eng", Codec: "subrip", Kind: probe.SubText},
+			`Track s:0 — English (subrip, text)`},
+		{probe.SubTrack{SubIndex: 1, Language: "en", Title: "SDH", Codec: "subrip", Kind: probe.SubText},
+			`Track s:1 — English "SDH" (subrip, text)`},
+		{probe.SubTrack{SubIndex: 2, Language: "pt", Codec: "ass", Kind: probe.SubText, Default: true},
+			`Track s:2 — Portuguese (ass, text) (default)`},
+		{probe.SubTrack{SubIndex: 3, Language: "qaa", Codec: "subrip", Kind: probe.SubText}, // unknown code passes through
+			`Track s:3 — qaa (subrip, text)`},
+		{probe.SubTrack{SubIndex: 4, Codec: "hdmv_pgs_subtitle", Kind: probe.SubBitmap}, // no language
+			`Track s:4 (hdmv_pgs_subtitle, bitmap)`},
+	}
+	for _, c := range cases {
+		if got := subTrackLabel(c.t); got != c.want {
+			t.Errorf("subTrackLabel = %q, want %q", got, c.want)
+		}
+	}
+}
+
+func TestSetSubtitleOutOfRange(t *testing.T) {
+	c := &Cast{subChoices: []subChoice{{label: "Off"}}}
+	if err := c.SetSubtitle(context.Background(), 5); err == nil {
+		t.Fatal("expected out-of-range error")
 	}
 }
 

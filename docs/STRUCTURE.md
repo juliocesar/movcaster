@@ -25,8 +25,9 @@ main.runCast → core.App.Start(ctx, CastRequest)
   ├─ newServer(devHost)                      bind HTTP on LAN IP routable to TV
   │    └─ SetDirectPlay(file)                default: serve raw file (range-seek)
   ├─ media.Duration = info.Duration          DIDL res@duration (fixes transcode seek bar)
-  ├─ applySubtitles(...)                      apply Decision; may switch server to transcode pipe
-  ├─ codecPlan(info) → transcode.Args         codec fallback if not already transcoding
+  ├─ buildDelivery(...)                       baseline direct-play → applySubtitles + codec
+  │    ├─ applySubtitles(...)                 apply Decision; may switch server to transcode pipe
+  │    └─ codecPlan(info) → transcode.Args    codec fallback if not already transcoding
   ├─ renderer.SetMedia(media) + Play()       SOAP SetAVTransportURI(+DIDL) then Play
   └─ returns *core.Cast → tui.Run(cast)      TUI drives the Cast controller until quit
                                              → cast.Close() tears down server+ffmpeg+tmp
@@ -94,6 +95,17 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
   HasVolume/Volume/SetVolume/Mute`, plus `Title/Device/SubInfo`, `Status(ctx)`, `Close(ctx)`.
   Direct-play vs transcode seek-restart logic (Stop→settle→retry SetURI/Play, `seekMu`
   serialized) lives here, moved verbatim from the old Session.
+- Live subtitle switching: `SubtitleChoices()` / `ActiveSubtitle()` expose the picker
+  (sidecar + each embedded track + Off), and `SetSubtitle(ctx, idx)` switches to a choice
+  by rebuilding delivery via `buildDelivery` at the current position and restarting through
+  `startPlayback` (+ a post-Play `Seek` for direct-play). Serialized against seeks (`seekMu`);
+  `buildArgs`/`ssOffset`/`subInfo`/`activeSub` are mutated under `c.mu`, and `Seek`/`Position`
+  snapshot `buildArgs` under the lock so a switch can swap modes mid-flight safely.
+- `buildDelivery(srv, media, abs, tmpDir, info, SubtitleOptions, forceTranscode, ss)` —
+  shared by `Start` and `SetSubtitle`. Resets to a direct-play baseline, then `subs.Decide` +
+  `applySubtitles` + codec fallback, returning a label + transcode-args builder. Silent (no
+  events) so a live switch can't corrupt the TUI; `Start` emits the label itself. Idempotent
+  across mode flips. `applySubtitles` is a silent free function taking the transcode offset `ss`.
 - Interfaces (consumer-side, with compile-time assertions): `DeviceFinder`,
   `RendererControl` (`*renderer.Renderer`), `MediaServer` (`*mediaserver.Server`), `Store`
   (`config`). Tests inject fakes; production defaults wire the real impls.
@@ -106,7 +118,8 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
   answer, emit "Looking for a TV..." and `waitForDevice` retries up to 10s before erroring.
   target: `selectTarget` by host IP → description-URL load). `pickDevice` (saved → sole → nil),
   `resolveSubtitle`, `subKind`, `mimeForExt`, `hostOf`/`ensureScheme`, `applyTranscode`,
-  `applySubtitles`, `codecPlan`, `retrySOAP`, `sleepCtx`.
+  `buildDelivery`/`applySubtitles`, `buildSubChoices`/`subTrackLabel`/`activeSubFor` (picker),
+  `codecPlan`, `retrySOAP`, `sleepCtx`.
 
 ### `internal/discovery` — SSDP discovery (goupnp)
 - `Device{FriendlyName, Location *url.URL, AVTransport *av1.AVTransport1, Rendering *av1.RenderingControl1}`.
@@ -170,6 +183,9 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 ### `internal/tui` — bubbletea view (thin)
 - `Controller` interface = the playback surface (`*core.Cast` implements it; the
   assertion in tui still references `*renderer.Renderer`, which also satisfies it).
+- `SubtitleController` = optional capability interface (`SubtitleChoices/ActiveSubtitle/
+  SetSubtitle/SubInfo`) the model type-asserts; only `*core.Cast` implements it, so the
+  picker never opens for `*renderer.Renderer` (kept off `Controller` so that assertion holds).
 - `Run(ctrl, Options{Title,Device,SubInfo,HasVolume}) → (Outcome, error)`. Elm loop:
   `model.Init/Update/View`. `Outcome` = `OutcomeQuit | OutcomeEnded | OutcomeNext`
   (read off the final model) tells `main` whether to advance to the next episode.
@@ -178,12 +194,15 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   and quits. `maxProgress` (furthest pos seen) is used because the TV may zero its
   reported position on a natural stop. The `seeking` gate keeps a mid-seek stop from
   counting. `n` sets `OutcomeNext` (Stop→Quit, like `q`).
-- Polling: `tickCmd` every 1s → `pollCmd` (Position+TransportState). **Skipped while `seeking`**
-  to avoid SOAP contention with a seek-restart.
+- Polling: `tickCmd` every 1s → `pollCmd` (Position+TransportState). **Skipped while `seeking`
+  or `switching`** to avoid SOAP contention with a seek-restart / subtitle switch.
+- Subtitle picker: `s` opens an overlay listing the choices (cursor on the active one); ↑/↓
+  (k/j) move, enter applies (`SetSubtitle`, sets `switching` until `subDoneMsg`), esc/`s` cancel.
 - Seek debounce: arrow → `armSeek` moves displayed target + bumps `seekGen` + arms 1s `seekFireMsg`;
   only the matching `seekGen` fires the real `ctrl.Seek` (60s budget) → `seekDoneMsg`. Position
   polls don't overwrite the target while `seeking`.
-- Keys: space/p play-pause, ←→/hl seek 10s, ↑↓/kj volume ±5, m mute, q/ctrl+c stop+quit.
+- Keys: space/p play-pause, ←→/hl seek 10s, ↑↓/kj volume ±5, m mute, s subtitle picker,
+  n next, q/ctrl+c stop+quit.
 
 ### `internal/config` — persistence
 - `Config{LastDeviceHost}` at `os.UserConfigDir()/movcaster/config.json`. `Load`(zero on miss)/`Save`.
