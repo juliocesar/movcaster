@@ -214,6 +214,9 @@ func runList(app *core.App) error {
 func runInfo(app *core.App, req core.CastRequest) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
+	if err := app.Doctor(ctx); err != nil {
+		return err
+	}
 	prep, err := app.Prepare(ctx, req)
 	if err != nil {
 		return err

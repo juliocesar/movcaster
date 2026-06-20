@@ -247,7 +247,7 @@ func (c *Cast) persistResume() {
 // the Preparation (whose strategy/label the caller may display). On any error
 // after the server is bound, it cleans up before returning.
 func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, error) {
-	if err := a.Doctor(); err != nil {
+	if err := a.Doctor(ctx); err != nil {
 		return nil, nil, err
 	}
 	if _, err := os.Stat(req.File); err != nil {
@@ -272,7 +272,11 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		return nil, nil, prep.DecideErr
 	}
 	if prep.ProbeErr != nil {
-		a.emit(Warn, "ffprobe failed, auto-detection limited: %v", prep.ProbeErr)
+		// Doctor already proved ffprobe runs, so a failure here is specific to this
+		// file. Say what we lose: no embedded-subtitle detection and no codec check,
+		// so we direct-play by container and apply only an explicit/sidecar subtitle.
+		a.emit(Warn, "could not probe %s: %v", filepath.Base(prep.AbsPath), prep.ProbeErr)
+		a.emit(Warn, "casting without probe data: no embedded-subtitle or codec detection (direct-play only) — pass --sub for subtitles, --transcode to force re-encode")
 	}
 	abs := prep.AbsPath
 

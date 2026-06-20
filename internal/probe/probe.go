@@ -3,6 +3,7 @@
 package probe
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -68,11 +69,21 @@ type ffOutput struct {
 
 // Probe runs ffprobe on path and returns parsed media info.
 func Probe(ctx context.Context, path string) (*MediaInfo, error) {
+	// -v error (not quiet) so genuine ffprobe complaints land in stderr; we
+	// capture that buffer ourselves and only surface it when the command fails.
+	// This also catches the dynamic loader aborting a broken binary before it
+	// runs (e.g. a Homebrew library left dangling by an upgrade), which would
+	// otherwise reduce to an opaque "signal: abort trap".
 	cmd := exec.CommandContext(ctx, "ffprobe",
-		"-v", "quiet", "-print_format", "json",
+		"-v", "error", "-print_format", "json",
 		"-show_streams", "-show_format", path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
+		if msg := firstLines(stderr.String(), 3); msg != "" {
+			return nil, fmt.Errorf("ffprobe: %w: %s", err, msg)
+		}
 		return nil, fmt.Errorf("ffprobe: %w", err)
 	}
 
@@ -131,3 +142,18 @@ func classify(codec string) SubKind {
 
 // HasVideo reports whether a usable video stream was found.
 func (m *MediaInfo) HasVideo() bool { return m.VideoCodec != "" }
+
+// firstLines returns at most n non-empty, trimmed lines of s joined with "; ",
+// for a compact single-line error suffix.
+func firstLines(s string, n int) string {
+	var kept []string
+	for _, l := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(l); t != "" {
+			kept = append(kept, t)
+			if len(kept) == n {
+				break
+			}
+		}
+	}
+	return strings.Join(kept, "; ")
+}

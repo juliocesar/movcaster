@@ -88,14 +88,64 @@ func (a *App) emit(level EventLevel, format string, args ...any) {
 	a.onEvent(Event{Level: level, Message: fmt.Sprintf(format, args...)})
 }
 
-// Doctor verifies external dependencies (ffmpeg + ffprobe on PATH).
-func (a *App) Doctor() error {
+// Doctor verifies the external dependencies (ffmpeg + ffprobe) are not only on
+// PATH but actually runnable. A present-but-broken binary (e.g. a missing shared
+// library after a Homebrew upgrade aborts the process before it runs) would pass
+// a bare LookPath, then crash at probe/transcode time and silently degrade the
+// cast (no subtitle auto-detection, no codec check). Launching `-version` turns
+// that into a clear, actionable failure up front.
+func (a *App) Doctor(ctx context.Context) error {
 	for _, bin := range []string{"ffmpeg", "ffprobe"} {
-		if _, err := exec.LookPath(bin); err != nil {
+		path, err := exec.LookPath(bin)
+		if err != nil {
 			return fmt.Errorf("%s not found on PATH; install ffmpeg (e.g. `brew install ffmpeg`)", bin)
+		}
+		vctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		out, err := exec.CommandContext(vctx, path, "-version").CombinedOutput()
+		cancel()
+		if err != nil {
+			msg := fmt.Sprintf("%s is installed (%s) but failed to run: %v", bin, path, err)
+			if hint := brokenBinaryHint(string(out)); hint != "" {
+				msg += "\n  " + hint
+			}
+			return fmt.Errorf("%s", msg)
 		}
 	}
 	return nil
+}
+
+// brokenBinaryHint inspects a failed dependency launch and, when it recognizes
+// the cause, returns an actionable suggestion (empty otherwise). The frequent
+// macOS case is a Homebrew shared library left dangling by an upgrade: the
+// dynamic loader aborts the process before it runs, which a relink repairs.
+func brokenBinaryHint(output string) string {
+	if !strings.Contains(output, "Library not loaded") && !strings.Contains(output, "dyld") {
+		return ""
+	}
+	if f := brewFormulaFromError(output); f != "" {
+		return fmt.Sprintf("a shared library is missing (often after `brew upgrade`); try: brew unlink %s && brew link %s   (or `brew reinstall ffmpeg`)", f, f)
+	}
+	return "a shared library is missing (often after `brew upgrade`); try: brew reinstall ffmpeg"
+}
+
+// brewFormulaFromError pulls the Homebrew formula name out of a missing-library
+// path such as /opt/homebrew/opt/sdl2/lib/libSDL2-2.0.0.dylib -> "sdl2". Works
+// for both Apple-Silicon (/opt/homebrew/opt) and Intel (/usr/local/opt) prefixes
+// by taking the segment after the last "/opt/" in the loader's message.
+func brewFormulaFromError(output string) string {
+	const marker = "/opt/"
+	i := strings.LastIndex(output, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := output[i+len(marker):]
+	if j := strings.IndexAny(rest, "/ \t\n\r'\""); j >= 0 {
+		rest = rest[:j]
+	}
+	if rest == "homebrew" { // matched ".../opt/homebrew/..." with no formula after
+		return ""
+	}
+	return rest
 }
 
 // ListDevices discovers DLNA renderers on the LAN.

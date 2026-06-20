@@ -18,7 +18,7 @@ build a `core.CastRequest` → call core → render `core.Event`s and drive the 
 
 ```
 main.runCast → core.App.Start(ctx, CastRequest)
-  ├─ Doctor()                                verify ffmpeg+ffprobe on PATH
+  ├─ Doctor(ctx)                             ffmpeg+ffprobe on PATH *and* launch `-version`
   ├─ selectDevice(target)  ── DeviceFinder ─► SSDP find renderer (or saved/--t)
   │    └─ emit Event "Casting to …"          + Store.Save(LastDeviceHost)
   ├─ Prepare(): probe.Probe + subs.Decide    MediaInfo + subtitle Decision (no TV I/O)
@@ -74,7 +74,9 @@ One import exposes everything a front-end needs. No UI toolkit, no `fmt.Println`
 progress is reported via `Options.OnEvent`, status via the live `Cast`.
 - `App` + `New(Options)` — holds injectable deps (`DeviceFinder`, `NewServer`,
   `NewRenderer`, `Store`, `OnEvent`); zero-value Options wires production impls.
-- `Doctor()` — ffmpeg/ffprobe on PATH (was `ensureFFmpeg`).
+- `Doctor(ctx)` — ffmpeg/ffprobe on PATH *and* runnable (launches `-version`; a present-
+  but-broken binary, e.g. a dangling Homebrew dylib, fails here with an actionable hint
+  instead of silently degrading mid-cast). Was `ensureFFmpeg`.
 - `ListDevices(ctx)` — discovery passthrough.
 - `Prepare(ctx, CastRequest) → *Preparation` — pure planning: probe + `subs.Decide`, no
   TV/network I/O. `Preparation{AbsPath, Info, Sidecar, Strategy, ProbeErr, DecideErr}` +
