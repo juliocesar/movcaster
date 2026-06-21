@@ -85,13 +85,15 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
   save config), bind server, `applySubtitles`, codec fallback (`codecPlan`), then
   `startPlayback` (Stop→settle→retry SetURI→retry Play; see below).
   Cleans up the server/tmp dir on any post-bind error.
-- `startPlayback(ctx, r, media)` — the fresh-cast control sequence: best-effort Stop, then
-  `waitTransportSettled` (poll TransportState until it leaves TRANSITIONING), then
-  `retrySOAP` SetAVTransportURI then Play. The Stop+settle is what avoids 701 "Transition
-  not available": webOS keeps reporting `LG_TRANSITIONING` for a beat or two after Stop
-  returns and rejects a new URI until it clears, so we poll its state rather than sleeping
-  a fixed interval (a blind 500ms wasn't enough — SetAVTransportURI fired too early both
-  reproduces the 701 and re-wedges the TV). Mirrors Seek's seek-restart tail.
+- `startPlayback(ctx, r, media)` — the fresh-cast control sequence: best-effort Stop,
+  `waitTransportSettled`, `retrySOAP` SetAVTransportURI, `waitTransportSettled` again, then
+  `retrySOAP` Play. webOS rejects both a new URI *and* a Play with 701 "Transition not
+  available" while it reports `LG_TRANSITIONING`, so we poll its state (not a fixed sleep) at
+  both points. The pre-URI wait clears a TV left mid-transition by a previous cast; the
+  pre-Play wait covers the TV buffering the freshly-set URI — which lingers for a live
+  transcode resumed deep into the file (e.g. `--resume` burning bitmap subs from 40 min in:
+  ffmpeg needs seconds to `-ss`-seek and emit the first fragment, so Play fired immediately
+  hits 701 even though offset-0 casts settle at once). Mirrors Seek's seek-restart tail.
 - `Cast` — the live, concurrency-safe handle (folds the former `internal/cast.Session`).
   Implements the TUI control surface: `Play/Pause/Stop/Seek/Position/TransportState/
   HasVolume/Volume/SetVolume/Mute`, plus `Title/Device/SubInfo`, `Status(ctx)`, `Close(ctx)`.
@@ -257,10 +259,14 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   Stop→settle→retry the SetURI/Play sequence (both the initial cast via `startPlayback`
   *and* seek-restart — a TV left mid-transition rejects a new URI with 701 "Transition not
   available" until it leaves the transitioning state); serialize seeks (`seekMu`).
-  webOS reports `LG_TRANSITIONING` and lingers there for ~1-2s *after* Stop returns, so
-  `startPlayback` polls TransportState until settled before SetURI rather than sleeping a
-  fixed interval. (Verified: a fake/unreachable URL yields 716 "Resource not found", not
-  701 — so 701 is purely a transport-state problem, fixed by waiting out the transition.)
+  webOS reports `LG_TRANSITIONING` and lingers there both for ~1-2s *after* Stop returns
+  *and* while it buffers a freshly-set URI, so `startPlayback` polls TransportState until
+  settled before SetURI *and* again before Play rather than sleeping a fixed interval. The
+  pre-Play wait matters for a live transcode resumed deep into the file (`--resume`): ffmpeg
+  takes seconds to `-ss`-seek + emit the first fragment, so the TV stays transitioning long
+  past the Play retries and Play hits 701 — invisible at offset 0, where the stream settles
+  at once. (Verified: a fake/unreachable URL yields 716 "Resource not found", not 701 — so
+  701 is purely a transport-state problem, fixed by waiting out the transition.)
 - **webOS does NOT demux embedded subs over DLNA** (sub button greys out) → bitmap subs
   default to burn-in, not mux-soft. `--mux-soft` is the opt-in 6a experiment (needs eyes on TV).
 - **webOS DOES honor `sec:CaptionInfoEx` for TEXT subs** → soft path serves srt/vtt at `/subs`.

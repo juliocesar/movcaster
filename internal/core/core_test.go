@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"strings"
 	"testing"
@@ -59,11 +60,25 @@ type fakeRenderer struct {
 	// `state`), to simulate a TV that lingers in TRANSITIONING after a Stop.
 	stateSeq   []string
 	stateCalls int
+
+	// transitioningAfterSet models a TV that, once it has the URI, sits in
+	// TRANSITIONING (buffering a slow deep-offset transcode) for this many
+	// TransportState polls before settling. While transitioning, Play is
+	// rejected — reproducing the 701 on the --resume path.
+	transitioningAfterSet int
+	setMediaCount         int
+	pollsAfterSet         int
+}
+
+// transitioning reports whether the TV is still buffering a freshly-set URI.
+func (r *fakeRenderer) transitioning() bool {
+	return r.setMediaCount > 0 && r.pollsAfterSet < r.transitioningAfterSet
 }
 
 func (r *fakeRenderer) SetMedia(_ context.Context, m renderer.Media) error {
 	r.calls = append(r.calls, "SetMedia")
 	r.media = m
+	r.setMediaCount++
 	if len(r.setMediaErrs) > 0 {
 		err := r.setMediaErrs[0]
 		r.setMediaErrs = r.setMediaErrs[1:]
@@ -71,7 +86,13 @@ func (r *fakeRenderer) SetMedia(_ context.Context, m renderer.Media) error {
 	}
 	return nil
 }
-func (r *fakeRenderer) Play(context.Context) error  { r.calls = append(r.calls, "Play"); return nil }
+func (r *fakeRenderer) Play(context.Context) error {
+	r.calls = append(r.calls, "Play")
+	if r.transitioning() {
+		return errors.New("701 Transition not available")
+	}
+	return nil
+}
 func (r *fakeRenderer) Pause(context.Context) error { r.calls = append(r.calls, "Pause"); return nil }
 func (r *fakeRenderer) Stop(context.Context) error  { r.calls = append(r.calls, "Stop"); return nil }
 func (r *fakeRenderer) Seek(_ context.Context, p time.Duration) error {
@@ -84,6 +105,10 @@ func (r *fakeRenderer) Position(context.Context) (time.Duration, time.Duration, 
 }
 func (r *fakeRenderer) TransportState(context.Context) (string, error) {
 	r.stateCalls++
+	if r.transitioning() {
+		r.pollsAfterSet++
+		return "LG_TRANSITIONING", nil
+	}
 	if len(r.stateSeq) > 0 {
 		s := r.stateSeq[0]
 		r.stateSeq = r.stateSeq[1:]
@@ -303,6 +328,22 @@ func TestStartPlaybackWaitsForTransitionToSettle(t *testing.T) {
 	}
 	if r.stateCalls < 3 {
 		t.Fatalf("expected to poll TransportState until settled, polled %d time(s)", r.stateCalls)
+	}
+	want := []string{"Stop", "SetMedia", "Play"}
+	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", r.calls, want)
+	}
+}
+
+// Regression for the --resume 701: after SetAVTransportURI the TV buffers the
+// freshly-set URI and rejects Play with 701 while it reports LG_TRANSITIONING.
+// A live transcode resumed deep into the file lingers there well past the Play
+// retries, so startPlayback must wait for the transport to settle *between*
+// SetMedia and Play, not only before SetMedia.
+func TestStartPlaybackWaitsAfterSetMediaBeforePlay(t *testing.T) {
+	r := &fakeRenderer{transitioningAfterSet: 3} // TV transitions for 3 polls post-URI, rejecting Play until then
+	if err := startPlayback(context.Background(), r, renderer.Media{URL: "http://test/media.mp4"}); err != nil {
+		t.Fatalf("expected startPlayback to wait out the post-URI transition, got %v", err)
 	}
 	want := []string{"Stop", "SetMedia", "Play"}
 	if strings.Join(r.calls, ",") != strings.Join(want, ",") {

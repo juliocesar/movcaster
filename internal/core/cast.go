@@ -669,16 +669,16 @@ func (c *Cast) SetSubtitle(ctx context.Context, idx int) error {
 	return nil
 }
 
-// startPlayback points the TV at media for a fresh cast: it first clears any
-// leftover transport state (best-effort Stop) and waits for the TV to actually
-// leave the transitioning state, then retries the SetAVTransportURI/Play
-// sequence. The Stop + settle matters because a TV mid-transition (left there by
-// a previous cast or another app — webOS reports "LG_TRANSITIONING") rejects a
-// new URI with 701 "Transition not available". Crucially, the TV keeps reporting
-// the transition for a second or two after Stop returns, so we poll its state
-// rather than sleeping a fixed interval; firing SetAVTransportURI too early is
-// exactly what triggers the 701. The retries cover the residual mid-transition
-// flakiness. Mirrors the seek-restart sequence in Seek.
+// startPlayback points the TV at media for a fresh cast: best-effort Stop, wait
+// for the TV to leave the transitioning state, SetAVTransportURI, wait again for
+// it to settle, then Play. webOS rejects both a new URI and a Play with 701
+// "Transition not available" while it reports "LG_TRANSITIONING", so we poll its
+// state at both points rather than sleeping a fixed interval (firing too early is
+// exactly what triggers the 701). The pre-URI wait covers a TV left mid-transition
+// by a previous cast; the pre-Play wait covers the TV buffering the freshly-set
+// URI — which lingers for a live transcode resumed deep into the file (its ffmpeg
+// needs seconds to -ss-seek and emit the first fragment). The retries cover
+// residual flakiness. Mirrors the seek-restart sequence in Seek.
 func startPlayback(ctx context.Context, r RendererControl, media renderer.Media) error {
 	stopCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	_ = r.Stop(stopCtx)
@@ -690,6 +690,18 @@ func startPlayback(ctx context.Context, r RendererControl, media renderer.Media)
 	}); err != nil {
 		return fmt.Errorf("SetAVTransportURI: %w", err)
 	}
+
+	// After accepting the URI the TV fetches the media URL and sits in
+	// TRANSITIONING while it buffers; it rejects Play with 701 until it leaves
+	// that state. A fresh/offset-0 stream settles almost immediately, but a live
+	// transcode resumed deep into the file (e.g. --resume burning bitmap subs
+	// from 40 min in) needs several seconds to -ss-seek and emit its first MP4
+	// fragment, so the TV lingers in TRANSITIONING long past the Play retries.
+	// Wait it out before Play (returns at once in the common fast case). Budget
+	// generously for a slow deep-offset transcode start; both waits fit the
+	// caller's 45s setCtx.
+	waitTransportSettled(ctx, r, 20*time.Second)
+
 	if err := retrySOAP(ctx, 3, 7*time.Second, func(ic context.Context) error {
 		return r.Play(ic)
 	}); err != nil {
