@@ -211,6 +211,7 @@ func (a *App) pickDevice(devices []discovery.Device) *discovery.Device {
 func (a *App) waitForDevice(ctx context.Context, budget time.Duration) (*discovery.Device, error) {
 	dctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	savedHost := a.store.Load().LastDeviceHost
 	for {
 		devices, err := a.finder.Discover(dctx)
 		if err == nil {
@@ -219,6 +220,13 @@ func (a *App) waitForDevice(ctx context.Context, budget time.Duration) (*discove
 			}
 			if len(devices) > 1 {
 				return nil, fmt.Errorf("%d renderers found; pick one with -t (run -l to list)", len(devices))
+			}
+		}
+		// A saved TV that's slow on multicast (common right after wake) often
+		// still answers a unicast probe, which also survives dropped multicast.
+		if savedHost != "" {
+			if d, err := a.finder.FindByHost(dctx, savedHost); err == nil {
+				return d, nil
 			}
 		}
 		if !sleepCtx(dctx, 500*time.Millisecond) {
@@ -240,10 +248,23 @@ func (a *App) selectTarget(ctx context.Context, target string) (*discovery.Devic
 			return &devices[i], nil
 		}
 	}
-	if u, err := url.Parse(ensureScheme(target)); err == nil && u.Host != "" {
+	// An explicit description URL (host + port) loads directly, no SSDP.
+	if u, err := url.Parse(ensureScheme(target)); err == nil && u.Host != "" && u.Port() != "" {
 		uctx, ucancel := context.WithTimeout(ctx, quickDiscover)
-		defer ucancel()
-		if d, err := a.finder.FindByURL(uctx, u); err == nil {
+		d, err := a.finder.FindByURL(uctx, u)
+		ucancel()
+		if err == nil {
+			return d, nil
+		}
+	}
+	// SSDP-free fallback: unicast probe straight to the host. Handles a bare IP
+	// (the control port is dynamic, so we can't guess a URL) and a multicast
+	// search that came up empty.
+	if wantHost != "" {
+		hctx, hcancel := context.WithTimeout(ctx, deepDiscover)
+		d, err := a.finder.FindByHost(hctx, wantHost)
+		hcancel()
+		if err == nil {
 			return d, nil
 		}
 	}

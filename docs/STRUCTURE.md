@@ -128,8 +128,15 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
 ### `internal/discovery` — SSDP discovery (goupnp)
 - `Device{FriendlyName, Location *url.URL, AVTransport *av1.AVTransport1, Rendering *av1.RenderingControl1}`.
   `Rendering` may be nil (no volume control).
-- `Discover(ctx) []Device` — `av1.NewAVTransport1ClientsCtx` + match RenderingControl by Location.
+- `Discover(ctx) []Device` — M-SEARCHes several targets concurrently (`AVTransport:1`,
+  `device:MediaRenderer:1`, `ssdp:all`) via `goupnp.DiscoverDevicesCtx`, dedups roots by
+  Location, then builds clients with `av1.New*ClientsFromRootDevice`. Broad on purpose:
+  a just-woke webOS TV often answers one target while missing another.
 - `FindByURL(ctx, loc) *Device` — load directly from a device-description URL (skips SSDP).
+- `FindByHost(ctx, host) *Device` — targeted M-SEARCH to the multicast group filtered to
+  one host, on its own longer any-ST window (webOS ignores unicast M-SEARCH). Learns the
+  TV's dynamic control port and recovers a specific TV a broad `Discover` keeps missing;
+  backs `-t <ip>` and saved-host resume.
 
 ### `internal/renderer` — AVTransport + RenderingControl + DIDL
 Thin typed wrapper over goupnp `av1` clients. InstanceID always 0, channel "Master".

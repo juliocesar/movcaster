@@ -25,6 +25,9 @@ import (
 type DeviceFinder interface {
 	Discover(ctx context.Context) ([]discovery.Device, error)
 	FindByURL(ctx context.Context, loc *url.URL) (*discovery.Device, error)
+	// FindByHost resolves a renderer by host/IP via a unicast SSDP probe,
+	// bypassing multicast discovery (which webOS drops right after wake).
+	FindByHost(ctx context.Context, host string) (*discovery.Device, error)
 }
 
 // RendererControl is the transport/volume control surface of a renderer.
@@ -89,6 +92,9 @@ func (realFinder) Discover(ctx context.Context) ([]discovery.Device, error) {
 }
 func (realFinder) FindByURL(ctx context.Context, loc *url.URL) (*discovery.Device, error) {
 	return discovery.FindByURL(ctx, loc)
+}
+func (realFinder) FindByHost(ctx context.Context, host string) (*discovery.Device, error) {
+	return discovery.FindByHost(ctx, host)
 }
 
 // configStore wraps the config package.

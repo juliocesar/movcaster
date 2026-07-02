@@ -21,6 +21,7 @@ type fakeFinder struct {
 	devices []discovery.Device
 	err     error
 	byURL   *discovery.Device
+	byHost  *discovery.Device
 }
 
 func (f fakeFinder) Discover(context.Context) ([]discovery.Device, error) {
@@ -31,6 +32,12 @@ func (f fakeFinder) FindByURL(context.Context, *url.URL) (*discovery.Device, err
 		return nil, context.Canceled
 	}
 	return f.byURL, nil
+}
+func (f fakeFinder) FindByHost(context.Context, string) (*discovery.Device, error) {
+	if f.byHost == nil {
+		return nil, context.Canceled
+	}
+	return f.byHost, nil
 }
 
 type fakeStore struct {
@@ -214,6 +221,37 @@ func TestSelectDeviceByHostIgnoresPort(t *testing.T) {
 	}
 }
 
+func TestSelectTargetFallsBackToFindByHost(t *testing.T) {
+	// Multicast finds nothing and a bare IP has no port to load directly; the
+	// unicast host probe must resolve it (dynamic control port and all).
+	tv := device("TV", "10.0.0.5:1653")
+	a := New(Options{Finder: fakeFinder{byHost: &tv}, Store: &fakeStore{}})
+	d, err := a.selectDevice(context.Background(), "10.0.0.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.FriendlyName != "TV" {
+		t.Fatalf("got %q", d.FriendlyName)
+	}
+}
+
+func TestWaitForDeviceRecoversSavedHostViaProbe(t *testing.T) {
+	// The --resume case: a saved TV that the multicast search keeps missing is
+	// recovered by probing the saved host directly.
+	tv := device("TV", "10.0.0.5:1653")
+	a := New(Options{
+		Finder: fakeFinder{byHost: &tv},
+		Store:  &fakeStore{cfg: config.Config{LastDeviceHost: "10.0.0.5"}},
+	})
+	d, err := a.selectDevice(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.FriendlyName != "TV" {
+		t.Fatalf("got %q", d.FriendlyName)
+	}
+}
+
 // seqFinder returns a different result per Discover call, simulating a renderer
 // that misses the first SSDP burst and only answers a later one.
 type seqFinder struct {
@@ -230,6 +268,9 @@ func (f *seqFinder) Discover(context.Context) ([]discovery.Device, error) {
 	return r.devices, r.err
 }
 func (f *seqFinder) FindByURL(context.Context, *url.URL) (*discovery.Device, error) {
+	return nil, context.Canceled
+}
+func (f *seqFinder) FindByHost(context.Context, string) (*discovery.Device, error) {
 	return nil, context.Canceled
 }
 
