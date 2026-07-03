@@ -253,20 +253,39 @@ func nextEpisode(cur core.CastRequest) (core.CastRequest, bool) {
 // advances via next until the sequence is exhausted or the user quits. autoNext
 // gates only the automatic on-end advance; an explicit "n" always advances if
 // there is a next item.
+//
+// The TUI comes up first: tui.Start owns the terminal immediately and shows a
+// connecting screen while app.Start runs in its goroutine, so there is no
+// window where the terminal is cooked (keys echoing) during discovery/probe/
+// SetURI. Core's events are routed into that screen for the duration.
 func runCast(app *core.App, req core.CastRequest, next nextProvider, autoNext bool) error {
-	ctx := context.Background()
 	for {
-		cast, _, err := app.Start(ctx, req)
-		if err != nil {
-			return err
+		outcome, ctrl, runErr := tui.Start(filepath.Base(req.File),
+			func(ctx context.Context, emit func(string)) (tui.Controller, tui.Options, error) {
+				// Route cast-phase events into the TUI (which owns the terminal);
+				// "! " marks Warn events so the connecting screen styles them apart.
+				app.SetEventSink(func(e core.Event) {
+					if e.Level == core.Warn {
+						emit("! " + e.Message)
+						return
+					}
+					emit(e.Message)
+				})
+				cast, _, err := app.Start(ctx, req)
+				if err != nil {
+					return nil, tui.Options{}, err
+				}
+				return cast, tui.Options{
+					Title:     cast.Title(),
+					Device:    cast.Device(),
+					SubInfo:   cast.SubInfo(),
+					HasVolume: cast.HasVolume(),
+				}, nil
+			})
+		app.SetEventSink(report) // back to stdout for anything outside the TUI
+		if cast, ok := ctrl.(*core.Cast); ok {
+			cast.Close(context.Background())
 		}
-		outcome, runErr := tui.Run(cast, tui.Options{
-			Title:     cast.Title(),
-			Device:    cast.Device(),
-			SubInfo:   cast.SubInfo(),
-			HasVolume: cast.HasVolume(),
-		})
-		cast.Close(ctx)
 		if runErr != nil {
 			return runErr
 		}

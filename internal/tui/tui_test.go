@@ -289,6 +289,128 @@ func TestViewRendersState(t *testing.T) {
 	}
 }
 
+func TestConnectingViewShowsStatusLines(t *testing.T) {
+	m := model{
+		connecting:  true,
+		title:       "Movie.mkv",
+		statusLines: []string{"Casting to TV [10.0.0.2:1653]", "! could not probe"},
+		prog:        newTestProgress(),
+	}
+	out := m.View()
+	for _, want := range []string{"Movie.mkv", "Casting to TV", "! could not probe", "q quit"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("connecting View() missing %q\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "play/pause") {
+		t.Errorf("connecting View() shows live-phase hints\n%s", out)
+	}
+}
+
+func TestStatusMsgAppends(t *testing.T) {
+	m := model{connecting: true, prog: newTestProgress()}
+	mi, _ := m.Update(statusMsg("Casting to TV"))
+	m = mi.(model)
+	mi, _ = m.Update(statusMsg("Subtitles: soft"))
+	m = mi.(model)
+	if len(m.statusLines) != 2 || m.statusLines[1] != "Subtitles: soft" {
+		t.Fatalf("statusLines = %v", m.statusLines)
+	}
+}
+
+func TestReadyMsgAdoptsController(t *testing.T) {
+	f := &fakeCtrl{}
+	m := model{connecting: true, prog: newTestProgress()}
+	mi, cmd := m.Update(readyMsg{ctrl: f, opts: Options{
+		Title: "Movie.mkv", Device: "TV", SubInfo: "burn-in", HasVolume: true,
+	}})
+	m = mi.(model)
+	if m.connecting {
+		t.Fatal("still connecting after readyMsg")
+	}
+	if m.ctrl != Controller(f) {
+		t.Fatal("controller not adopted")
+	}
+	if m.title != "Movie.mkv" || m.device != "TV" || m.subInfo != "burn-in" || !m.hasVol {
+		t.Fatalf("options not applied: %+v", m)
+	}
+	if cmd == nil {
+		t.Fatal("readyMsg did not start the live poll loop")
+	}
+}
+
+func TestReadyMsgAfterQuitAdoptsWithoutPolling(t *testing.T) {
+	// The user quit while connecting, then the start finished anyway: the
+	// controller must still be adopted (so Start returns it for teardown) but
+	// the model stays quitting and must not begin the live loop.
+	f := &fakeCtrl{}
+	m := model{connecting: true, quitting: true, prog: newTestProgress()}
+	mi, cmd := m.Update(readyMsg{ctrl: f})
+	m = mi.(model)
+	if m.ctrl == nil || !m.quitting {
+		t.Fatalf("ctrl=%v quitting=%v, want adopted/true", m.ctrl, m.quitting)
+	}
+	if cmd == nil {
+		t.Fatal("expected a quit command")
+	}
+}
+
+func TestStartErrMsgQuitsWithError(t *testing.T) {
+	m := model{connecting: true, prog: newTestProgress()}
+	mi, cmd := m.Update(startErrMsg{err: context.DeadlineExceeded})
+	m = mi.(model)
+	if m.startErr == nil || !m.quitting || m.outcome != OutcomeQuit {
+		t.Fatalf("startErr=%v quitting=%v outcome=%v", m.startErr, m.quitting, m.outcome)
+	}
+	if cmd == nil {
+		t.Fatal("startErrMsg did not quit")
+	}
+}
+
+func TestQuitWhileConnecting(t *testing.T) {
+	m := model{connecting: true, prog: newTestProgress()} // ctrl deliberately nil
+	mi, cmd := m.Update(keyRune('q'))
+	m = mi.(model)
+	if !m.quitting || m.outcome != OutcomeQuit {
+		t.Fatalf("quitting=%v outcome=%v, want true/Quit", m.quitting, m.outcome)
+	}
+	if cmd == nil {
+		t.Fatal("q while connecting returned no quit command")
+	}
+}
+
+func TestKeysSwallowedWhileConnecting(t *testing.T) {
+	// No controller yet: every non-quit key must be a no-op (a live-phase
+	// handler would nil-deref the controller).
+	m := model{connecting: true, prog: newTestProgress()}
+	for _, msg := range []tea.KeyMsg{
+		{Type: tea.KeySpace}, {Type: tea.KeyRight}, {Type: tea.KeyUp},
+		keyRune('m'), keyRune('s'), keyRune('n'),
+	} {
+		mi, cmd := m.Update(msg)
+		m = mi.(model)
+		if cmd != nil || m.quitting {
+			t.Fatalf("key %v acted while connecting", msg)
+		}
+	}
+}
+
+func TestSpinnerStopsAfterConnecting(t *testing.T) {
+	// While connecting a spin tick re-arms; once live it must die (the 1s tick
+	// loop started by readyMsg drives polling instead).
+	m := model{connecting: true, prog: newTestProgress()}
+	mi, cmd := m.Update(spinMsg(time.Now()))
+	m = mi.(model)
+	if cmd == nil || m.spinFrame != 1 {
+		t.Fatalf("spin tick did not re-arm while connecting (frame=%d)", m.spinFrame)
+	}
+	m.connecting = false
+	_, cmd = m.Update(spinMsg(time.Now()))
+	if cmd != nil {
+		t.Fatal("spin tick re-armed after connecting ended")
+	}
+}
+
 func TestFmtDur(t *testing.T) {
 	cases := map[time.Duration]string{
 		0:                  "00:00",

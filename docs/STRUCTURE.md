@@ -17,20 +17,22 @@ All orchestration lives in `internal/core`. `main` is a thin client: parse flags
 build a `core.CastRequest` → call core → render `core.Event`s and drive the TUI.
 
 ```
-main.runCast → core.App.Start(ctx, CastRequest)
-  ├─ Doctor(ctx)                             ffmpeg+ffprobe on PATH *and* launch `-version`
-  ├─ selectDevice(target)  ── DeviceFinder ─► SSDP find renderer (or saved/--t)
-  │    └─ emit Event "Casting to …"          + Store.Save(LastDeviceHost)
-  ├─ Prepare(): probe.Probe + subs.Decide    MediaInfo + subtitle Decision (no TV I/O)
-  ├─ newServer(devHost)                      bind HTTP on LAN IP routable to TV
-  │    └─ SetDirectPlay(file)                default: serve raw file (range-seek)
-  ├─ media.Duration = info.Duration          DIDL res@duration (fixes transcode seek bar)
-  ├─ buildDelivery(...)                       baseline direct-play → applySubtitles + codec
-  │    ├─ applySubtitles(...)                 apply Decision; may switch server to transcode pipe
-  │    └─ codecPlan(info) → transcode.Args    codec fallback if not already transcoding
-  ├─ renderer.SetMedia(media) + Play()       SOAP SetAVTransportURI(+DIDL) then Play
-  └─ returns *core.Cast → tui.Run(cast)      TUI drives the Cast controller until quit
-                                             → cast.Close() tears down server+ffmpeg+tmp
+main.runCast → tui.Start(title, startFn)    TUI grabs the terminal FIRST (connecting screen);
+  │                                         startFn runs in a goroutine, emits → statusMsg lines
+  └─ startFn: SetEventSink(→TUI) + core.App.Start(ctx, CastRequest)
+       ├─ Doctor(ctx)                             ffmpeg+ffprobe on PATH *and* launch `-version`
+       ├─ selectDevice(target)  ── DeviceFinder ─► SSDP find renderer (or saved/--t)
+       │    └─ emit Event "Casting to …"          + Store.Save(LastDeviceHost)
+       ├─ Prepare(): probe.Probe + subs.Decide    MediaInfo + subtitle Decision (no TV I/O)
+       ├─ newServer(devHost)                      bind HTTP on LAN IP routable to TV
+       │    └─ SetDirectPlay(file)                default: serve raw file (range-seek)
+       ├─ media.Duration = info.Duration          DIDL res@duration (fixes transcode seek bar)
+       ├─ buildDelivery(...)                       baseline direct-play → applySubtitles + codec
+       │    ├─ applySubtitles(...)                 apply Decision; may switch server to transcode pipe
+       │    └─ codecPlan(info) → transcode.Args    codec fallback if not already transcoding
+       ├─ renderer.SetMedia(media) + Play()       SOAP SetAVTransportURI(+DIDL) then Play (async tail)
+       └─ returns *core.Cast → readyMsg           TUI flips connecting → live view, drives the Cast
+                                                  until quit → main closes it (server+ffmpeg+tmp)
 ```
 
 The TV pulls media from our HTTP server; we push control via SOAP to the TV. Two
@@ -51,16 +53,22 @@ orchestration logic.
   `-resume` (no file arg) casts the last played video via `resumeFile` (newest still-existing
   entry from `resume.Store.Recent()`, skipping missing ones), then runs like a normal cast;
   mutually exclusive with a file arg and `--playlist`.
-- `report(Event)` — `Info`→stdout, `Warn`→stderr with the `movcaster:` prefix. This is
-  the one place core's progress lines become terminal output.
+- `report(Event)` — `Info`→stdout, `Warn`→stderr with the `movcaster:` prefix. Used
+  outside a cast (`-l`, `--info`, "Resuming:", "Up next:"); during a cast the sink is
+  swapped to the TUI (below) so nothing prints under bubbletea.
 - `runList(app)` — `-l`: `app.ListDevices` + print.
 - `runInfo(app, req)` — `--info`: `app.Prepare` then print `DescribeStreams`/`DescribeStrategy`.
   ProbeErr is fatal (matches old behavior: aborts before printing); DecideErr prints
   streams then errors.
-- `runCast(app, req, next, autoNext)` — loop: `app.Start` → `tui.Run(cast, …)` →
-  `cast.Close`. On `OutcomeEnded` (with `autoNext`) or `OutcomeNext` (the `n` key),
-  call the `nextProvider` for the next request and cast it; otherwise return. Prints
-  "Up next: <base>" between items.
+- `runCast(app, req, next, autoNext)` — loop: `tui.Start(base(file), startFn)` where
+  startFn does `app.SetEventSink(→ emit)` (Warn events get a `"! "` prefix) then
+  `app.Start(ctx, req)`; the TUI owns the terminal from t≈0 and shows the events on a
+  connecting screen. After `tui.Start` returns, restore `SetEventSink(report)` and
+  `Close` the returned controller (returned even if the user quit while connecting, so
+  a late-started cast is never leaked). On `OutcomeEnded` (with `autoNext`) or
+  `OutcomeNext` (the `n` key), call the `nextProvider` for the next request and cast
+  it; otherwise return. Prints "Up next: <base>" between items (before the next
+  `tui.Start` grabs the terminal).
 - `nextProvider`/`nextEpisode` — `next(cur) (CastRequest, bool)` abstracts "what plays
   next". `nextEpisode` uses `nextep.Find` (same-dir episode); `-no-next` clears
   `autoNext` in this mode. Both providers carry subtitle/codec opts forward and clear
@@ -74,6 +82,9 @@ One import exposes everything a front-end needs. No UI toolkit, no `fmt.Println`
 progress is reported via `Options.OnEvent`, status via the live `Cast`.
 - `App` + `New(Options)` — holds injectable deps (`DeviceFinder`, `NewServer`,
   `NewRenderer`, `Store`, `OnEvent`); zero-value Options wires production impls.
+- `SetEventSink(fn)` — swaps the `OnEvent` destination at runtime; the CLI routes
+  cast-phase events into the TUI's connecting screen and restores its stdout reporter
+  afterward. Single-goroutine use per cast (no lock); not safe for concurrent casts.
 - `Doctor(ctx)` — ffmpeg/ffprobe on PATH *and* runnable (launches `-version`; a present-
   but-broken binary, e.g. a dangling Homebrew dylib, fails here with an actionable hint
   instead of silently degrading mid-cast). Was `ensureFFmpeg`.
@@ -217,6 +228,19 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 - `Run(ctrl, Options{Title,Device,SubInfo,HasVolume}) → (Outcome, error)`. Elm loop:
   `model.Init/Update/View`. `Outcome` = `OutcomeQuit | OutcomeEnded | OutcomeNext`
   (read off the final model) tells `main` whether to advance to the next episode.
+- `Start(title, startFn) → (Outcome, Controller, error)` — TUI-first entry point:
+  grabs the terminal immediately and shows a connecting screen (title + one line per
+  `emit(...)` call; a `"! "` prefix renders as a warning; braille spinner on a 200ms
+  `spinMsg` tick) while `startFn(ctx, emit)` runs in a goroutine. `readyMsg` adopts
+  the returned `Controller`+`Options` and flips to the live view (starting the 1s
+  tick/poll loop; the spinner loop dies); `startErrMsg` quits with the error. While
+  `connecting`, `ctrl` is nil: no polling, no volume fetch, and every key except
+  q/ctrl+c is swallowed. Quit-while-connecting cancels startFn's ctx (aborting
+  `app.Start`), then Start reaps the goroutine's result over a channel and returns
+  its Controller (possibly produced after the quit) so the caller can always close
+  it — never a leak, never a shared-var race. An abandoned start's error is
+  suppressed (self-inflicted by the cancel); a `startErrMsg` error is returned.
+  `Run` is unchanged (direct controller use / tests).
 - End-of-media: a `posMsg` with a stopped state (`STOPPED`/`NO_MEDIA_PRESENT`), after
   `everPlayed`, with `maxProgress` within `endGuard` (12s) of `dur`, sets `OutcomeEnded`
   and quits. `maxProgress` (furthest pos seen) is used because the TV may zero its
@@ -299,8 +323,10 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   polling/control (no SOAP) meanwhile so the TUI renders instantly and shows buffering.
   (Verified against the TV: the Play handshake no longer gates the TUI — the bar renders
   after the synchronous SetURI and shows BUFFERING→PLAYING instead of freezing on Play;
-  quitting mid-buffer cancels the handshake and exits in ~140ms. Note the remaining
-  pre-render latency is discovery + subtitle extraction, not playback control.)
+  quitting mid-buffer cancels the handshake and exits in ~140ms.) The remaining
+  pre-render latency (discovery + probe + subtitle extraction + SetURI, ~8-11s) is
+  covered by TUI-first startup: `tui.Start` owns the terminal from t≈0 and narrates
+  those steps on a connecting screen, so the terminal is never cooked mid-startup.
 - **webOS does NOT demux embedded subs over DLNA** (sub button greys out) → bitmap subs
   default to burn-in, not mux-soft. `--mux-soft` is the opt-in 6a experiment (needs eyes on TV).
 - **webOS DOES honor `sec:CaptionInfoEx` for TEXT subs** → soft path serves srt/vtt at `/subs`.

@@ -81,6 +81,13 @@ func New(opts Options) *App {
 	return a
 }
 
+// SetEventSink swaps the destination for progress Events. The CLI uses this to
+// route cast-phase events into the TUI (which owns the terminal) instead of
+// stdout, restoring its stdout reporter after the TUI returns. Single-goroutine
+// use per cast (Start emits only from the goroutine that called it), so no lock;
+// not safe for concurrent casts.
+func (a *App) SetEventSink(fn func(Event)) { a.onEvent = fn }
+
 func (a *App) emit(level EventLevel, format string, args ...any) {
 	if a.onEvent == nil {
 		return

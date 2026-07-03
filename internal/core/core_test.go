@@ -787,3 +787,13 @@ var _ interface {
 	SetVolume(context.Context, int) error
 	Mute(context.Context, bool) error
 } = (*Cast)(nil)
+
+func TestSetEventSinkRoutesEvents(t *testing.T) {
+	a := New(Options{OnEvent: func(Event) { t.Fatal("event reached the replaced sink") }})
+	var got []string
+	a.SetEventSink(func(e Event) { got = append(got, e.Message) })
+	a.emit(Info, "hello %s", "tv")
+	if len(got) != 1 || got[0] != "hello tv" {
+		t.Fatalf("routed events = %v, want [hello tv]", got)
+	}
+}

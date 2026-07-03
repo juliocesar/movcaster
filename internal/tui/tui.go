@@ -72,6 +72,19 @@ type posMsg struct {
 type volMsg int
 type errMsg struct{ err error }
 
+// Connecting-phase messages (see Start). statusMsg appends a progress line to
+// the connecting screen; readyMsg delivers the live controller and flips to the
+// normal view; startErrMsg aborts the TUI with the startup error. spinMsg
+// drives the connecting spinner (a faster tick than the 1s polling tick; its
+// loop dies once connecting is over).
+type statusMsg string
+type readyMsg struct {
+	ctrl Controller
+	opts Options
+}
+type startErrMsg struct{ err error }
+type spinMsg time.Time
+
 // seekFireMsg fires seekDebounce after a seek keypress; gen lets a newer press
 // supersede an older pending one.
 type seekFireMsg struct{ gen int }
@@ -119,6 +132,15 @@ type model struct {
 	subChoices  []string
 	subCursor   int
 	switching   bool
+
+	// Connecting phase (Start): ctrl is nil until readyMsg adopts it, so every
+	// command that touches the controller is gated on !connecting. statusLines
+	// are the emit(...) progress lines; startErr is a failed startup, surfaced
+	// to the caller after the loop ends.
+	connecting  bool
+	statusLines []string
+	startErr    error
+	spinFrame   int
 }
 
 // Options configure the view.
@@ -150,15 +172,84 @@ func Run(ctrl Controller, opts Options) (Outcome, error) {
 	return OutcomeQuit, err
 }
 
+// startResult carries what startFn produced out of its goroutine, so a
+// controller that finishes starting after the user has already quit is still
+// delivered to the caller for teardown instead of leaking.
+type startResult struct {
+	ctrl Controller
+	opts Options
+	err  error
+}
+
+// Start launches the TUI immediately, showing a connecting screen (title +
+// progress lines) while startFn brings the cast up in a goroutine. startFn
+// reports progress via emit — each string becomes a line on the screen; a
+// "! "-prefixed line renders as a warning — and returns the live Controller
+// plus view Options once playback has begun, at which point the view flips to
+// the normal progress UI. Its ctx is cancelled if the user quits while still
+// connecting. The adopted Controller is returned so the caller can close it;
+// a non-nil Controller must be closed even when the outcome is a quit or an
+// error from the run itself.
+func Start(title string, startFn func(ctx context.Context, emit func(string)) (Controller, Options, error)) (Outcome, Controller, error) {
+	m := model{
+		connecting: true,
+		title:      title,
+		state:      "...",
+		width:      60,
+		prog:       progress.New(progress.WithDefaultGradient(), progress.WithWidth(50)),
+	}
+	p := tea.NewProgram(m)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resCh := make(chan startResult, 1)
+	go func() {
+		ctrl, opts, err := startFn(ctx, func(s string) { p.Send(statusMsg(s)) })
+		resCh <- startResult{ctrl: ctrl, opts: opts, err: err}
+		if err != nil {
+			p.Send(startErrMsg{err})
+			return
+		}
+		p.Send(readyMsg{ctrl: ctrl, opts: opts})
+	}()
+
+	final, err := p.Run()
+	fm, _ := final.(model)
+	if fm.ctrl != nil {
+		return fm.outcome, fm.ctrl, err
+	}
+	// The model never adopted a controller: startFn failed, or the user quit
+	// while connecting. Cancel the start and reap its result — if it produced a
+	// controller anyway (it won the race with the quit), hand it back so the
+	// caller closes it rather than leaking the server/ffmpeg/tmp dir.
+	cancel()
+	res := <-resCh
+	if err == nil {
+		// A quit-while-connecting cancels startFn, so an error from an
+		// abandoned start (res.err) is self-inflicted noise; only a startup
+		// failure the model saw (startErr) is the user's problem.
+		err = fm.startErr
+	}
+	return fm.outcome, res.ctrl, err
+}
+
 func (m model) Init() tea.Cmd {
-	// Volume is fetched lazily once the TV is actually playing (see posMsg): a
-	// RenderingControl read issued while the TV is still buffering/transitioning
-	// comes back 606 "Action not authorized", which would flash a spurious error.
+	// While connecting there is no controller to poll; the spinner tick is the
+	// only driver. Volume is fetched lazily once the TV is actually playing (see
+	// posMsg): a RenderingControl read issued while the TV is still buffering/
+	// transitioning comes back 606 "Action not authorized", which would flash a
+	// spurious error.
+	if m.connecting {
+		return spinCmd()
+	}
 	return tea.Batch(tickCmd(), m.pollCmd())
 }
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func spinCmd() tea.Cmd {
+	return tea.Tick(200*time.Millisecond, func(t time.Time) tea.Msg { return spinMsg(t) })
 }
 
 func withCtx(d time.Duration) (context.Context, context.CancelFunc) {
@@ -224,6 +315,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tickCmd()
 		}
 		return m, tea.Batch(tickCmd(), m.pollCmd())
+
+	case spinMsg:
+		if !m.connecting {
+			return m, nil // spinner loop ends once the live view takes over
+		}
+		m.spinFrame++
+		return m, spinCmd()
+
+	case statusMsg:
+		m.statusLines = append(m.statusLines, string(msg))
+		return m, nil
+
+	case readyMsg:
+		m.ctrl = msg.ctrl
+		m.title = msg.opts.Title
+		m.device = msg.opts.Device
+		m.subInfo = msg.opts.SubInfo
+		m.hasVol = msg.opts.HasVolume
+		m.connecting = false
+		if m.quitting {
+			// The user quit as the cast came up; adopt the controller only so
+			// Start returns it for teardown — don't begin polling.
+			return m, tea.Quit
+		}
+		// Begin the normal live loop. Volume stays deferred (see posMsg).
+		return m, tea.Batch(tickCmd(), m.pollCmd())
+
+	case startErrMsg:
+		m.startErr = msg.err
+		m.quitting = true
+		return m, tea.Quit
 
 	case posMsg:
 		m.dur, m.state = msg.dur, msg.state
@@ -308,6 +430,18 @@ func (m *model) armSeek(target time.Duration) tea.Cmd {
 }
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// While connecting there is no controller yet: only quitting works (Start's
+	// caller cancels the in-flight startup); every other key is swallowed.
+	if m.connecting {
+		switch msg.String() {
+		case "q", "ctrl+c":
+			m.quitting = true
+			m.outcome = OutcomeQuit
+			return m, tea.Quit
+		}
+		return m, nil
+	}
+
 	// While the subtitle picker is open it owns the keyboard.
 	if m.subMenuOpen {
 		return m.handleSubMenuKey(msg)
@@ -438,7 +572,15 @@ var (
 
 func (m model) View() string {
 	if m.quitting {
+		if m.connecting {
+			// Never went live (quit or startup error while connecting): leave the
+			// screen clean; main reports a startup error on stderr itself.
+			return ""
+		}
 		return "Stopped.\n"
+	}
+	if m.connecting {
+		return m.viewConnecting()
 	}
 	var pct float64
 	if m.dur > 0 {
@@ -484,6 +626,28 @@ func (m model) View() string {
 		out += " " + errStyle.Render("! "+m.lastErr.Error()) + "\n"
 	}
 	return out
+}
+
+// spinFrames animate the connecting screen's in-progress line (braille spinner).
+var spinFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// viewConnecting renders the startup screen: the title, one row per progress
+// line startFn emitted (a "! " prefix marks a warning), and an animated
+// connecting indicator. Shown until readyMsg flips to the live view.
+func (m model) viewConnecting() string {
+	var b strings.Builder
+	b.WriteString("\n " + titleStyle.Render(m.title) + "\n\n")
+	for _, line := range m.statusLines {
+		if strings.HasPrefix(line, "! ") {
+			b.WriteString(" " + errStyle.Render(line) + "\n")
+			continue
+		}
+		b.WriteString(" " + stateStyle.Render("✓") + " " + line + "\n")
+	}
+	spin := spinFrames[m.spinFrame%len(spinFrames)]
+	b.WriteString(" " + stateStyle.Render(spin) + " " + dimStyle.Render("Connecting…") + "\n")
+	b.WriteString("\n " + dimStyle.Render("q quit") + "\n")
+	return b.String()
 }
 
 // renderSubMenu renders the subtitle picker overlay: one row per choice, the
