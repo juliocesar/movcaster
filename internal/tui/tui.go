@@ -86,11 +86,12 @@ type model struct {
 	device  string
 	subInfo string
 
-	pos, dur time.Duration
-	state    string
-	volume   int
-	hasVol   bool
-	muted    bool
+	pos, dur   time.Duration
+	state      string
+	volume     int
+	hasVol     bool
+	muted      bool
+	volFetched bool // volume read succeeded once (deferred until the TV is ready)
 
 	prog     progress.Model
 	width    int
@@ -150,7 +151,10 @@ func Run(ctrl Controller, opts Options) (Outcome, error) {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(tickCmd(), m.pollCmd(), m.fetchVolCmd())
+	// Volume is fetched lazily once the TV is actually playing (see posMsg): a
+	// RenderingControl read issued while the TV is still buffering/transitioning
+	// comes back 606 "Action not authorized", which would flash a spurious error.
+	return tea.Batch(tickCmd(), m.pollCmd())
 }
 
 func tickCmd() tea.Cmd {
@@ -183,7 +187,9 @@ func (m model) fetchVolCmd() tea.Cmd {
 		defer cancel()
 		v, err := m.ctrl.Volume(ctx)
 		if err != nil {
-			return errMsg{err}
+			// Swallow: a mid-transition read is expected to fail with 606; posMsg
+			// retries on the next poll until it succeeds, so don't alarm the user.
+			return nil
 		}
 		return volMsg(v)
 	}
@@ -239,6 +245,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
+		// Fetch volume once the TV has settled out of the (buffering) transitioning
+		// state; retried each poll until it succeeds. RenderingControl reads issued
+		// while transitioning fail with 606, so we defer rather than fetch at Init.
+		if m.hasVol && !m.volFetched && msg.state != "" && msg.state != "TRANSITIONING" {
+			return m, m.fetchVolCmd()
+		}
 		return m, nil
 
 	case seekFireMsg:
@@ -272,6 +284,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case volMsg:
 		m.volume = int(msg)
+		m.volFetched = true
 		return m, nil
 
 	case errMsg:

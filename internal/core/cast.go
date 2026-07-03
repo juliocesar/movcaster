@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juliocesar/movcaster/internal/config"
@@ -58,6 +59,16 @@ type Cast struct {
 	resume     resumeStore
 	resumePath string // absolute file path, key into the resume store
 
+	// Async playback start. Start returns as soon as the TV accepts the URI (so
+	// the TUI renders at once); the slow settle+Play+resume-seek handshake runs
+	// in a goroutine. While starting is true, the AVTransport read/control
+	// methods short-circuit (no SOAP) so the TUI's polling can't contend with the
+	// in-flight handshake — the TUI just shows a buffering state. startCancel
+	// aborts the handshake on Close.
+	starting    atomic.Bool
+	startCancel context.CancelFunc
+	startDone   chan struct{}
+
 	// teardown
 	closeOnce    sync.Once
 	tmpDir       string
@@ -84,10 +95,36 @@ func (c *Cast) SubInfo() string {
 }
 func (c *Cast) HasVolume() bool { return c.hasVol }
 
-func (c *Cast) Play(ctx context.Context) error  { return c.r.Play(ctx) }
-func (c *Cast) Pause(ctx context.Context) error { return c.r.Pause(ctx) }
-func (c *Cast) Stop(ctx context.Context) error  { return c.r.Stop(ctx) }
+// Play/Pause are no-ops while the initial start handshake is still running: the
+// stream is already buffering (webOS auto-plays on SetAVTransportURI) and issuing
+// competing control there is exactly what makes the TV choke mid-transition.
+func (c *Cast) Play(ctx context.Context) error {
+	if c.starting.Load() {
+		return nil
+	}
+	return c.r.Play(ctx)
+}
+func (c *Cast) Pause(ctx context.Context) error {
+	if c.starting.Load() {
+		return nil
+	}
+	return c.r.Pause(ctx)
+}
+
+// Stop cancels an in-flight start handshake (so its background SOAP stops racing
+// us) before stopping the TV. Called on quit and by Close.
+func (c *Cast) Stop(ctx context.Context) error {
+	if c.startCancel != nil {
+		c.startCancel()
+	}
+	return c.r.Stop(ctx)
+}
 func (c *Cast) TransportState(ctx context.Context) (string, error) {
+	// While starting, report the buffering state without hitting the TV so the
+	// TUI shows "BUFFERING" instead of contending with the start handshake.
+	if c.starting.Load() {
+		return "TRANSITIONING", nil
+	}
 	return c.r.TransportState(ctx)
 }
 func (c *Cast) Volume(ctx context.Context) (int, error)    { return c.r.Volume(ctx) }
@@ -98,6 +135,11 @@ func (c *Cast) Mute(ctx context.Context, on bool) error    { return c.r.Mute(ctx
 // TV's reported position is segment-relative, so we add the segment offset and
 // substitute the probed duration (a fragmented stream has no total duration).
 func (c *Cast) Position(ctx context.Context) (pos, dur time.Duration, err error) {
+	// While starting, don't poll the TV (avoid contending with the start
+	// handshake); report 0 against the known duration so the TUI can draw its bar.
+	if c.starting.Load() {
+		return 0, c.knownDuration, nil
+	}
 	pos, dur, err = c.r.Position(ctx)
 	c.mu.Lock()
 	build, off := c.buildArgs, c.ssOffset
@@ -155,6 +197,11 @@ type Status struct {
 // stream (Stop -> settle -> SetAVTransportURI -> Play). The control sequence is
 // serialized and each SOAP step is retried, because TVs are flaky mid-transition.
 func (c *Cast) Seek(ctx context.Context, pos time.Duration) error {
+	// Ignore seeks issued before playback has actually started; the position is
+	// still 0 and a seek would collide with the start handshake.
+	if c.starting.Load() {
+		return nil
+	}
 	build := c.currentBuild()
 	if build == nil {
 		return c.r.Seek(ctx, pos)
@@ -210,6 +257,17 @@ func (c *Cast) Seek(ctx context.Context, pos time.Duration) error {
 func (c *Cast) Close(ctx context.Context) error {
 	var err error
 	c.closeOnce.Do(func() {
+		// Abort any in-flight start handshake and let it unwind before we tear the
+		// server down, so its background SOAP isn't still talking to the TV.
+		if c.startCancel != nil {
+			c.startCancel()
+		}
+		if c.startDone != nil {
+			select {
+			case <-c.startDone:
+			case <-time.After(2 * time.Second):
+			}
+		}
 		c.persistResume()
 		if c.releaseAwake != nil {
 			c.releaseAwake()
@@ -334,21 +392,19 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		a.emit(Info, "Resuming at %s", clock(startOffset))
 	}
 
-	setCtx, setCancel := context.WithTimeout(ctx, 45*time.Second)
-	defer setCancel()
-	if err := startPlayback(setCtx, rend, media); err != nil {
+	// Hand the URI to the TV synchronously so we can still fail Start cleanly if
+	// the device rejects it. This returns as soon as the URI is accepted, at which
+	// point webOS starts buffering/auto-playing — the slow bit (waiting out the
+	// buffering TRANSITIONING state, then Play, then a direct-play resume seek) is
+	// run off the critical path below so the TUI renders immediately instead of
+	// freezing for the seconds a large direct-play file takes to buffer.
+	setCtx, setCancel := context.WithTimeout(ctx, 15*time.Second)
+	err = setTransportURI(setCtx, rend, media)
+	setCancel()
+	if err != nil {
 		_ = srv.Shutdown(context.Background())
 		_ = os.RemoveAll(tmpDir)
 		return nil, nil, err
-	}
-
-	// Direct-play resume: seek after Play (best-effort; the TV may need a moment
-	// to leave the TRANSITIONING state, so retry briefly). Transcode resume is
-	// already baked into the stream offset above.
-	if build == nil && startOffset > 0 {
-		_ = retrySOAP(setCtx, 4, 3*time.Second, func(c context.Context) error {
-			return rend.Seek(c, startOffset)
-		})
 	}
 
 	choices := buildSubChoices(prep.Info, prep.Sidecar)
@@ -379,6 +435,34 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 	if build != nil {
 		c.ssOffset = startOffset // transcode stream starts at this absolute offset
 	}
+
+	// Finish playback startup in the background: wait out the buffering
+	// TRANSITIONING state, Play, and (for direct-play resume) seek to the saved
+	// offset. While this runs, the Cast's AVTransport read/control methods
+	// short-circuit (see starting) so the TUI can render and poll without
+	// contending with these SOAP calls. Uses its own context (Start's ctx may be
+	// short-lived); Close cancels it.
+	c.starting.Store(true)
+	startCtx, startCancel := context.WithTimeout(context.Background(), 45*time.Second)
+	c.startCancel = startCancel
+	c.startDone = make(chan struct{})
+	go func() {
+		defer close(c.startDone)
+		defer startCancel()
+		defer c.starting.Store(false)
+		if err := beginPlayback(startCtx, rend); err != nil {
+			return
+		}
+		// Direct-play resume: seek after Play (best-effort; the TV may need a moment
+		// to leave TRANSITIONING, so retry briefly). Transcode resume is already
+		// baked into the stream offset.
+		if build == nil && startOffset > 0 {
+			_ = retrySOAP(startCtx, 4, 3*time.Second, func(ic context.Context) error {
+				return rend.Seek(ic, startOffset)
+			})
+		}
+	}()
+
 	return c, prep, nil
 }
 
@@ -680,6 +764,18 @@ func (c *Cast) SetSubtitle(ctx context.Context, idx int) error {
 // needs seconds to -ss-seek and emit the first fragment). The retries cover
 // residual flakiness. Mirrors the seek-restart sequence in Seek.
 func startPlayback(ctx context.Context, r RendererControl, media renderer.Media) error {
+	if err := setTransportURI(ctx, r, media); err != nil {
+		return err
+	}
+	return beginPlayback(ctx, r)
+}
+
+// setTransportURI is the fast half of startPlayback: best-effort Stop, wait for
+// the TV to leave the transitioning state left by a previous cast, then
+// SetAVTransportURI. It returns as soon as the TV has accepted the URI — at which
+// point webOS begins fetching/auto-playing the stream — so the caller can bring
+// up the UI without waiting on the (slow) Play handshake in beginPlayback.
+func setTransportURI(ctx context.Context, r RendererControl, media renderer.Media) error {
 	stopCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	_ = r.Stop(stopCtx)
 	cancel()
@@ -690,7 +786,14 @@ func startPlayback(ctx context.Context, r RendererControl, media renderer.Media)
 	}); err != nil {
 		return fmt.Errorf("SetAVTransportURI: %w", err)
 	}
+	return nil
+}
 
+// beginPlayback is the slow half of startPlayback: wait for the TV to finish
+// buffering the freshly-set URI (it rejects Play with 701 while TRANSITIONING),
+// then Play. For a large direct-play file or a deep-offset transcode this wait
+// runs into the seconds, which is why Start runs it off the critical path.
+func beginPlayback(ctx context.Context, r RendererControl) error {
 	// After accepting the URI the TV fetches the media URL and sits in
 	// TRANSITIONING while it buffers; it rejects Play with 701 until it leaves
 	// that state. A fresh/offset-0 stream settles almost immediately, but a live

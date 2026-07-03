@@ -83,18 +83,35 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
   `DescribeStreams()`/`DescribeStrategy()`. Reused by `--info` and `Start`.
 - `Start(ctx, CastRequest) → (*Cast, *Preparation)` — resolve device (emit "Casting to",
   save config), bind server, `applySubtitles`, codec fallback (`codecPlan`), then
-  `startPlayback` (Stop→settle→retry SetURI→retry Play; see below).
-  Cleans up the server/tmp dir on any post-bind error.
-- `startPlayback(ctx, r, media)` — the fresh-cast control sequence: best-effort Stop,
-  `waitTransportSettled`, `retrySOAP` SetAVTransportURI, `waitTransportSettled` again, then
-  `retrySOAP` Play. webOS rejects both a new URI *and* a Play with 701 "Transition not
-  available" while it reports `LG_TRANSITIONING`, so we poll its state (not a fixed sleep) at
-  both points. The pre-URI wait clears a TV left mid-transition by a previous cast; the
-  pre-Play wait covers the TV buffering the freshly-set URI — which lingers for a live
+  `setTransportURI` (Stop→settle→retry SetURI) *synchronously* and return the `Cast`;
+  the slow tail (`beginPlayback`: settle→retry Play, then a direct-play resume seek) runs
+  in a **background goroutine**. This is deliberate: `Start` used to also block on the
+  pre-Play settle + Play, which for a large *direct-play* file (the TV sits in
+  `LG_TRANSITIONING` buffering a high-bitrate stream, and its control endpoint lags) delayed
+  the caller by 14–45s — so the TUI never rendered and the terminal stayed cooked (echoed
+  keys) while the movie already auto-played. Returning after SetURI (which the TV accepts
+  fast, then auto-buffers) lets the TUI render at once and show buffering. Cleans up the
+  server/tmp dir on any pre-return error; the goroutine uses its own 45s context, cancelled
+  by `Close`/`Stop`.
+- `startPlayback` / `setTransportURI` / `beginPlayback` (cast.go) — the fresh-cast control
+  sequence, split so the fast half can run on the critical path and the slow half off it.
+  `setTransportURI`: best-effort Stop, `waitTransportSettled`, `retrySOAP` SetAVTransportURI.
+  `beginPlayback`: `waitTransportSettled` again, then `retrySOAP` Play. `startPlayback` = both
+  (still used by `SetSubtitle`, which the TUI already gates via `switching`). webOS rejects
+  both a new URI *and* a Play with 701 "Transition not available" while it reports
+  `LG_TRANSITIONING`, so we poll its state (not a fixed sleep) at both points. The pre-URI
+  wait clears a TV left mid-transition by a previous cast; the pre-Play wait covers the TV
+  buffering the freshly-set URI — which lingers for a large direct-play file *and* for a
   transcode resumed deep into the file (e.g. `--resume` burning bitmap subs from 40 min in:
   ffmpeg needs seconds to `-ss`-seek and emit the first fragment, so Play fired immediately
-  hits 701 even though offset-0 casts settle at once). Mirrors Seek's seek-restart tail.
+  hits 701 even though small offset-0 casts settle at once). Mirrors Seek's seek-restart tail.
 - `Cast` — the live, concurrency-safe handle (folds the former `internal/cast.Session`).
+  While `Start`'s background tail runs, `starting` (atomic) makes the AVTransport
+  read/control methods (`Position`/`TransportState`/`Play`/`Pause`/`Seek`) short-circuit
+  *without SOAP* — `Position`→`(0, knownDur)`, `TransportState`→`TRANSITIONING`, controls→
+  no-op — so the TUI's polling can't contend with the in-flight Stop/SetURI/Play handshake;
+  it just shows a buffering state. `Stop`/`Close` cancel the handshake (`startCancel`) and
+  `Close` drains `startDone` before shutting the server down.
   Implements the TUI control surface: `Play/Pause/Stop/Seek/Position/TransportState/
   HasVolume/Volume/SetVolume/Mute`, plus `Title/Device/SubInfo`, `Status(ctx)`, `Close(ctx)`.
   Direct-play vs transcode seek-restart logic (Stop→settle→retry SetURI/Play, `seekMu`
@@ -274,6 +291,16 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   past the Play retries and Play hits 701 — invisible at offset 0, where the stream settles
   at once. (Verified: a fake/unreachable URL yields 716 "Resource not found", not 701 — so
   701 is purely a transport-state problem, fixed by waiting out the transition.)
+- **The pre-Play settle + Play must NOT block `Start`** → it can take 14–45s for a large
+  direct-play file (TV lingers in `LG_TRANSITIONING` buffering a high-bitrate stream and is
+  slow to ACK Play), during which the TUI hasn't rendered and the terminal is still cooked
+  (keys echo as `^[[B`) even though the movie already auto-plays. `Start` returns right after
+  SetURI and runs `beginPlayback` in a goroutine; the `Cast.starting` flag gates AVTransport
+  polling/control (no SOAP) meanwhile so the TUI renders instantly and shows buffering.
+  (Verified against the TV: the Play handshake no longer gates the TUI — the bar renders
+  after the synchronous SetURI and shows BUFFERING→PLAYING instead of freezing on Play;
+  quitting mid-buffer cancels the handshake and exits in ~140ms. Note the remaining
+  pre-render latency is discovery + subtitle extraction, not playback control.)
 - **webOS does NOT demux embedded subs over DLNA** (sub button greys out) → bitmap subs
   default to burn-in, not mux-soft. `--mux-soft` is the opt-in 6a experiment (needs eyes on TV).
 - **webOS DOES honor `sec:CaptionInfoEx` for TEXT subs** → soft path serves srt/vtt at `/subs`.

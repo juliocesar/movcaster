@@ -392,6 +392,38 @@ func TestStartPlaybackWaitsAfterSetMediaBeforePlay(t *testing.T) {
 	}
 }
 
+// While the async start handshake is in flight (starting == true), the AVTransport
+// read/control methods must short-circuit without touching the renderer, so the
+// TUI can render and poll without contending with the in-flight Stop/SetURI/Play.
+func TestStartingGatesAVTransport(t *testing.T) {
+	r := &fakeRenderer{pos: 42 * time.Second, dur: 5 * time.Second, state: "PLAYING"}
+	c := &Cast{r: r, srv: &fakeServer{}, knownDuration: 3600 * time.Second}
+	c.starting.Store(true)
+
+	pos, dur, err := c.Position(context.Background())
+	if err != nil || pos != 0 || dur != 3600*time.Second {
+		t.Fatalf("Position while starting = (%v,%v,%v), want (0, 3600s, nil)", pos, dur, err)
+	}
+	if st, _ := c.TransportState(context.Background()); st != "TRANSITIONING" {
+		t.Fatalf("TransportState while starting = %q, want TRANSITIONING", st)
+	}
+	if err := c.Play(context.Background()); err != nil {
+		t.Fatalf("Play while starting: %v", err)
+	}
+	if err := c.Seek(context.Background(), 30*time.Second); err != nil {
+		t.Fatalf("Seek while starting: %v", err)
+	}
+	if len(r.calls) != 0 {
+		t.Fatalf("expected no renderer calls while starting, got %v", r.calls)
+	}
+
+	// Once started, the same methods hit the renderer again.
+	c.starting.Store(false)
+	if st, _ := c.TransportState(context.Background()); st != "PLAYING" {
+		t.Fatalf("TransportState after start = %q, want PLAYING", st)
+	}
+}
+
 func TestSeekDirectPlayNative(t *testing.T) {
 	r := &fakeRenderer{}
 	c := &Cast{r: r, srv: &fakeServer{}} // buildArgs nil => direct-play
