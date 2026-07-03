@@ -41,6 +41,7 @@ func main() {
 		noNext     = flag.Bool("no-next", false, "do not auto-play the next episode in the directory when one ends")
 		plist      = flag.String("playlist", "", "cast a playlist file (one video path per line; # comments allowed)")
 		resumeLast = flag.Bool("resume", false, "continue the last played video (no file argument)")
+		resumeName = flag.String("resume-last", "", "continue the most recent played video whose name matches PATTERN (fuzzy, no file argument)")
 	)
 	flag.Usage = usage
 	flag.Parse()
@@ -86,12 +87,17 @@ func main() {
 			fmt.Fprintln(os.Stderr, "movcaster: --playlist takes the file list from the playlist; don't also pass a file argument")
 			os.Exit(2)
 		}
-		if *resumeLast {
-			fmt.Fprintln(os.Stderr, "movcaster: --resume and --playlist are mutually exclusive")
+		if *resumeLast || *resumeName != "" {
+			fmt.Fprintln(os.Stderr, "movcaster: --resume/--resume-last and --playlist are mutually exclusive")
 			os.Exit(2)
 		}
 		fail(runPlaylist(app, base, *plist))
 		return
+	}
+
+	if *resumeLast && *resumeName != "" {
+		fmt.Fprintln(os.Stderr, "movcaster: --resume and --resume-last are mutually exclusive")
+		os.Exit(2)
 	}
 
 	if *resumeLast {
@@ -103,6 +109,23 @@ func main() {
 			fail(fmt.Errorf("resume is disabled, cannot continue the last video"))
 		}
 		path, err := resumeFile(rs)
+		fail(err)
+		req := base
+		req.File = path
+		fmt.Println("Resuming:", filepath.Base(path))
+		fail(runCast(app, req, nextEpisode, !*noNext))
+		return
+	}
+
+	if *resumeName != "" {
+		if len(flag.Args()) != 0 {
+			fmt.Fprintln(os.Stderr, "movcaster: --resume-last matches a played video by name; don't also pass a file argument")
+			os.Exit(2)
+		}
+		if rs == nil {
+			fail(fmt.Errorf("resume is disabled, cannot continue a video"))
+		}
+		path, err := resumeMatchFile(rs, *resumeName)
 		fail(err)
 		req := base
 		req.File = path
@@ -144,6 +167,7 @@ Usage:
   movcaster -l                       list renderers
   movcaster <file>                   cast (auto subs, auto codec fallback)
   movcaster --resume                 continue the last played video
+  movcaster --resume-last PATTERN    continue the last played video matching PATTERN
   movcaster <file> -t TARGET         target a device (IP, IP:port, or device URL)
   movcaster <file> --info            show streams + chosen subtitle strategy
   movcaster <file> --sub foo.srt     force an explicit soft subtitle
@@ -167,6 +191,8 @@ burned in on the fly. The chosen device is remembered for next time.
 Resume: playback positions are remembered per file; re-casting a file picks up
 where you stopped. --resume (no file argument) continues the most recently played
 video, then auto-advances like a normal cast unless --no-next is given.
+--resume-last PATTERN continues the most recent played video whose name fuzzily
+matches PATTERN (e.g. --resume-last hannibal), not just the very last one.
 
 Next episode: when a file ends, the next episode in the same directory (same
 show, next season/episode) is detected and cast automatically. Press n to skip
@@ -346,6 +372,24 @@ func resumeFile(rs *resume.Store) (string, error) {
 		fmt.Fprintln(os.Stderr, "movcaster: skipping missing resume entry:", p)
 	}
 	return "", fmt.Errorf("no recently played video to resume")
+}
+
+// resumeMatchFile returns the best fuzzy match for pattern among the played
+// videos, newest-first on ties (see resume.Rank). Since-deleted entries are
+// skipped (and warned about) so a stale index row doesn't dead-end the match.
+// Errors when nothing matches closely enough or no match still exists on disk.
+func resumeMatchFile(rs *resume.Store, pattern string) (string, error) {
+	matches := resume.Rank(pattern, rs.Recent())
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no played video matches %q", pattern)
+	}
+	for _, p := range matches {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p, nil
+		}
+		fmt.Fprintln(os.Stderr, "movcaster: skipping missing resume entry:", p)
+	}
+	return "", fmt.Errorf("no played video matching %q still exists", pattern)
 }
 
 // existingFiles drops entries that don't exist or aren't regular files, warning

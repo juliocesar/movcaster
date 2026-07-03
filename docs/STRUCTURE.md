@@ -53,6 +53,10 @@ orchestration logic.
   `-resume` (no file arg) casts the last played video via `resumeFile` (newest still-existing
   entry from `resume.Store.Recent()`, skipping missing ones), then runs like a normal cast;
   mutually exclusive with a file arg and `--playlist`.
+  `-resume-last <pattern>` (no file arg) fuzzy-matches `pattern` against the played videos'
+  base names via `resumeMatchFile` (→ `resume.Rank` over `Recent()`, newest-first on ties,
+  skipping since-deleted entries) and resumes the best match; mutually exclusive with a file
+  arg, `--playlist`, and `--resume`.
 - `report(Event)` — `Info`→stdout, `Warn`→stderr with the `movcaster:` prefix. Used
   outside a cast (`-l`, `--info`, "Resuming:", "Up next:"); during a cast the sink is
   swapped to the TUI (below) so nothing prints under bubbletea.
@@ -267,6 +271,12 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   `Recent()` returns the keys newest-first by `updated_at` (unparseable timestamps sort
   last) — backs `main`'s `--resume`; since finished files are `Clear`ed, `Recent()[0]` is
   the last in-progress video.
+- `Rank(pattern, paths) []string` (match.go) — orders `paths` by how well their base names
+  fuzzy-match `pattern`, best first, dropping anything below `matchThreshold` (0.6); ties keep
+  input order (so newest-first Recent() input → newest match wins). Scoring: normalize both to
+  lowercase alphanumeric words (separators/case/extension don't matter), then exact →
+  whole-pattern substring → mean of per-word best similarity (substring or edit-distance ratio,
+  tolerating a small typo). Backs `--resume-last`. Pure (no I/O), unit-tested.
 - Wired by `main` and injected via `core.Options.Resume` (nil in tests → resume disabled).
   `core.Start` reads it (see `resumeOffset`: skips <5s or within 30s of the end) and starts
   a transcode at the saved offset / seeks a direct-play file after Play. `core.Cast` caches
