@@ -126,6 +126,7 @@ movcaster <file> --no-subs         cast without subtitles
 movcaster <file> --transcode       force a codec-compatibility transcode
 movcaster <file> --no-next         don't auto-play the next episode when one ends
 movcaster --resume                 continue the last played video
+movcaster --resume-last PATTERN    continue the last played video matching PATTERN
 movcaster --playlist list.txt      cast each file in a playlist, in order
 ```
 
@@ -155,6 +156,14 @@ Don't remember which file you had on? `movcaster --resume` (no file argument)
 picks the most recently played video and continues it. If that file has since
 moved, it falls back to the next most recent. From there it behaves like a normal
 cast, auto-advancing to the next episode on end unless you pass `--no-next`.
+
+Juggling a few shows at once? `movcaster --resume-last PATTERN` continues the most
+recently played video whose name matches `PATTERN` instead of just the very last
+one. The match is fuzzy, not a regex — `movcaster --resume-last hannibal` finds
+`Hannibal (2013) - S02E10 - Naka-Choko (1080p BluRay x265 RCVR).mkv`. Case,
+punctuation, and word order don't matter, and a small typo is forgiven; an
+unrelated pattern that matches nothing closely just errors rather than casting
+something random.
 
 ## Next episode, automatically
 
