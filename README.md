@@ -160,10 +160,9 @@ cast, auto-advancing to the next episode on end unless you pass `--no-next`.
 Juggling a few shows at once? `movcaster --resume-last PATTERN` continues the most
 recently played video whose name matches `PATTERN` instead of just the very last
 one. The match is fuzzy, not a regex — `movcaster --resume-last hannibal` finds
-`Hannibal (2013) - S02E10 - Naka-Choko (1080p BluRay x265 RCVR).mkv`. Case,
-punctuation, and word order don't matter, and a small typo is forgiven; an
-unrelated pattern that matches nothing closely just errors rather than casting
-something random.
+that half-watched Hannibal episode. Case, punctuation, and word order don't
+matter, and a small typo is forgiven; an unrelated pattern that matches nothing
+closely just errors rather than casting something random.
 
 ## Next episode, automatically
 
