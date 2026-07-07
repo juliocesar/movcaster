@@ -200,19 +200,23 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 ### `internal/probe` — ffprobe wrapper + sub classification
 - `Probe(ctx,path) *MediaInfo{Duration,VideoCodec,AudioCodec,Subtitles[]}` via
   `ffprobe -print_format json -show_streams -show_format`. Skips attached_pic (cover art).
-- `SubTrack{Index, SubIndex (s:N selector), Codec, Kind, Language, Title, Default}`.
+- `SubTrack{Index, SubIndex (s:N selector), Codec, Kind, Language, Title, Default, Forced}`.
+  `Forced` (disposition) marks a foreign-dialogue-only track that `selectTrack` deprioritizes.
 - `SubKind`: `SubText` (subrip/ass/mov_text/webvtt…) | `SubBitmap` (dvd_subtitle/pgs/vobsub/dvbsub…) | `SubUnknown`.
 
 ### `internal/subs` — strategy + ffmpeg arg/command builders
 - `Decide(Request) Decision` — the decision tree (strategy.go). `Kind`:
   `None | SoftSidecar | SoftExtract | MuxSoft | Burn`. Order: NoSubs→None; sidecar→SoftSidecar;
-  no tracks→None; `selectTrack` (explicit `TrackIndex`, else prefer TEXT, else default/first);
-  ForceSoft (err if bitmap)→SoftExtract; ForceBurn→Burn; auto text→SoftExtract; auto bitmap→
-  Burn (or MuxSoft if `MuxSoftTry`). nil-safe on `Info`.
+  no tracks→None; `selectTrack` (explicit `TrackIndex`, else prefer TEXT, else default/first;
+  each preference skips `Forced` tracks when a non-forced peer exists via `preferNonForced` —
+  a forced track only carries foreign-dialogue lines and is a confusing default on English
+  releases); ForceSoft (err if bitmap)→SoftExtract; ForceBurn→Burn; auto text→SoftExtract;
+  auto bitmap→Burn (or MuxSoft if `MuxSoftTry`). nil-safe on `Info`.
 - `BurnArgs(input,track,ss) []string` (burn.go) — fragmented-mp4-on-pipe ffmpeg. Bitmap:
   `[0:v][0:s:N]overlay`. Text: `subtitles=…:si=N`. `-c:v libx264 -preset veryfast -crf 22`,
   aac, `-movflags +frag_keyframe+empty_moov+default_base_moof`, `-dn -map_chapters -1`. `ss`=input seek.
-- `ExtractText(ctx,input,subIndex,destDir) → vttPath` (extract.go) — `-map 0:s:N -c:s webvtt`.
+- `ExtractText(ctx,input,subIndex,destDir) → srtPath` (extract.go) — `-map 0:s:N -c:s subrip -f srt`.
+  SRT, not WebVTT: webOS's `sec:CaptionInfoEx` renders SRT reliably but not VTT over DLNA.
 - `MuxSoftRemux(ctx,input,track,destDir) → mkvPath` (burn.go) — `-c copy` remux of v+a+sub (experimental 6a).
 
 ### `internal/transcode` — codec-compat transcode (no subs)
@@ -339,7 +343,12 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   those steps on a connecting screen, so the terminal is never cooked mid-startup.
 - **webOS does NOT demux embedded subs over DLNA** (sub button greys out) → bitmap subs
   default to burn-in, not mux-soft. `--mux-soft` is the opt-in 6a experiment (needs eyes on TV).
-- **webOS DOES honor `sec:CaptionInfoEx` for TEXT subs** → soft path serves srt/vtt at `/subs`.
+- **webOS DOES honor `sec:CaptionInfoEx` for TEXT subs, but only SRT (not WebVTT) over DLNA**
+  → both the sidecar and the embedded-extract soft paths serve `.srt` (`sec:type="srt"`) at
+  `/subs`. Extracting to VTT parses but renders nothing on the TV (verified). Serve SRT.
+- **Forced subtitle tracks are a trap default** → an English release often ships a `forced`
+  track first (default-flagged) that only subtitles foreign-dialogue scenes, so it looks like
+  "subs don't work". `selectTrack` skips forced tracks in auto-selection (see `preferNonForced`).
 - **serveTranscode sends headers before launching ffmpeg** so SetAVTransportURI doesn't block.
 - `ss` selectors use `0:s:<SubIndex>` (subtitle-stream index), not the absolute stream index.
 - **macOS idle sleep throttles a cast** → when the laptop display sleeps, the system

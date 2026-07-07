@@ -93,7 +93,7 @@ func Decide(req Request) (Decision, error) {
 	// subs over DLNA, see plan 0.4); --mux-soft opts into the experimental soft path.
 	switch track.Kind {
 	case probe.SubText:
-		return Decision{Kind: SoftExtract, Track: track, Reason: "embedded text track"}, nil
+		return Decision{Kind: SoftExtract, Track: track, Reason: fmt.Sprintf("embedded text track s:%d", track.SubIndex)}, nil
 	case probe.SubBitmap:
 		if req.MuxSoftTry {
 			return Decision{Kind: MuxSoft, Track: track, Reason: "--mux-soft on bitmap track (experimental)"}, nil
@@ -105,8 +105,11 @@ func Decide(req Request) (Decision, error) {
 }
 
 // selectTrack picks the subtitle track to act on. With an explicit index, it must
-// exist. Otherwise it prefers a text track (best UX: soft), else the default
-// track, else the first.
+// exist (forced or not — the user asked for it). Otherwise it prefers a text
+// track (best UX: soft), else the default track, else the first — and within each
+// of those preferences it skips Forced tracks when a non-forced peer exists, since
+// a forced track only carries foreign-dialogue lines and shows nothing the rest of
+// the time (a common, confusing default on English releases).
 func selectTrack(list []probe.SubTrack, req Request) (*probe.SubTrack, error) {
 	if req.TrackIndex >= 0 {
 		for i := range list {
@@ -119,16 +122,34 @@ func selectTrack(list []probe.SubTrack, req Request) (*probe.SubTrack, error) {
 
 	// Auto-selection. When burning is forced we don't bias toward text.
 	if !req.ForceBurn {
-		for i := range list {
-			if list[i].Kind == probe.SubText {
-				return &list[i], nil
-			}
+		if t := preferNonForced(list, func(t probe.SubTrack) bool { return t.Kind == probe.SubText }); t != nil {
+			return t, nil
 		}
 	}
-	for i := range list {
-		if list[i].Default {
-			return &list[i], nil
-		}
+	if t := preferNonForced(list, func(t probe.SubTrack) bool { return t.Default }); t != nil {
+		return t, nil
+	}
+	if t := preferNonForced(list, func(probe.SubTrack) bool { return true }); t != nil {
+		return t, nil
 	}
 	return &list[0], nil
+}
+
+// preferNonForced returns the first track satisfying want, preferring one that is
+// not Forced; it falls back to a forced match only when no non-forced peer
+// satisfies want. Returns nil if nothing matches.
+func preferNonForced(list []probe.SubTrack, want func(probe.SubTrack) bool) *probe.SubTrack {
+	var forced *probe.SubTrack
+	for i := range list {
+		if !want(list[i]) {
+			continue
+		}
+		if !list[i].Forced {
+			return &list[i]
+		}
+		if forced == nil {
+			forced = &list[i]
+		}
+	}
+	return forced
 }

@@ -538,12 +538,13 @@ func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, 
 	case subs.SoftExtract:
 		ectx, ecancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer ecancel()
-		vtt, err := subs.ExtractText(ectx, abs, dec.Track.SubIndex, tmpDir)
+		srt, err := subs.ExtractText(ectx, abs, dec.Track.SubIndex, tmpDir)
 		if err != nil {
 			return "", nil, err
 		}
-		srv.SetSubtitle(vtt, "text/vtt")
-		media.SubURL, media.SubMIME, media.SubType = srv.SubURL(), "text/vtt", "vtt"
+		mime, typ := subKind(srt)
+		srv.SetSubtitle(srt, mime)
+		media.SubURL, media.SubMIME, media.SubType = srv.SubURL(), mime, typ
 		label = fmt.Sprintf("soft: embedded track %d", dec.Track.SubIndex)
 		return label, nil, nil
 
@@ -612,6 +613,9 @@ func subTrackLabel(t probe.SubTrack) string {
 	fmt.Fprintf(&b, " (%s, %s)", t.Codec, t.Kind)
 	if t.Default {
 		b.WriteString(" (default)")
+	}
+	if t.Forced {
+		b.WriteString(" (forced)")
 	}
 	return b.String()
 }

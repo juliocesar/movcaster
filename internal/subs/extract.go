@@ -9,15 +9,18 @@ import (
 )
 
 // ExtractText extracts an embedded text subtitle track (by subtitle-stream index,
-// i.e. the s:N selector) to a WebVTT file in destDir, returning its path. webOS
-// renders WebVTT soft subs delivered via the DLNA caption mechanism.
+// i.e. the s:N selector) to a SubRip (.srt) file in destDir, returning its path.
+// webOS renders soft subs delivered via the DLNA caption mechanism
+// (sec:CaptionInfoEx); it honors SRT reliably but not WebVTT, so we serve SRT to
+// match the (verified) sidecar path. Non-subrip text sources (ass/mov_text/webvtt)
+// are converted to subrip, dropping styling the TV wouldn't render anyway.
 func ExtractText(ctx context.Context, input string, subIndex int, destDir string) (string, error) {
-	out := filepath.Join(destDir, fmt.Sprintf("subs.%d.vtt", subIndex))
+	out := filepath.Join(destDir, fmt.Sprintf("subs.%d.srt", subIndex))
 	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-y", "-i", input,
 		"-map", fmt.Sprintf("0:s:%d", subIndex),
-		"-c:s", "webvtt",
-		"-f", "webvtt", out,
+		"-c:s", "subrip",
+		"-f", "srt", out,
 	)
 	if b, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("extract subtitle track %d: %w: %s", subIndex, err, lastLine(b))

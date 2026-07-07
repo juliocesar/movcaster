@@ -137,7 +137,8 @@ movcaster picks a strategy so you don't have to:
 1. A sidecar `.srt`/`.vtt` (or `--sub`) → **soft** subs via the DLNA caption
    mechanism (`sec:CaptionInfoEx`). The TV draws them; size/style live in the TV's
    caption settings.
-2. An embedded **text** track → extracted to WebVTT → **soft**.
+2. An embedded **text** track → extracted to SRT → **soft** (forced-only tracks are
+   skipped when picking the default, since they subtitle just foreign-dialogue scenes).
 3. A **bitmap** track (`dvd_subtitle`/PGS/VobSub) → **burned in** on the fly with
    ffmpeg `overlay` (playback starts in seconds; no full pre-encode).
    `--mux-soft` instead remuxes it as a soft track to try the TV's own renderer.

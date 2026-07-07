@@ -16,6 +16,41 @@ func text(i int) probe.SubTrack {
 func bitmap(i int) probe.SubTrack {
 	return probe.SubTrack{SubIndex: i, Codec: "dvd_subtitle", Kind: probe.SubBitmap}
 }
+func forcedText(i int) probe.SubTrack {
+	t := text(i)
+	t.Forced = true
+	return t
+}
+
+// TestSelectTrackSkipsForced mirrors the common English release: a forced track
+// (foreign-dialogue only) sits first and is even flagged default, but auto should
+// land on a full non-forced track so subtitles actually show.
+func TestSelectTrackSkipsForced(t *testing.T) {
+	forced := forcedText(0)
+	forced.Default = true
+	full := text(1)
+	sdh := text(2)
+
+	got, err := selectTrack([]probe.SubTrack{forced, full, sdh}, Request{TrackIndex: -1})
+	if err != nil {
+		t.Fatalf("selectTrack error: %v", err)
+	}
+	if got.SubIndex != 1 {
+		t.Fatalf("auto picked s:%d, want the non-forced full track s:1", got.SubIndex)
+	}
+
+	// An explicit --sub-track still honors a forced choice.
+	got, err = selectTrack([]probe.SubTrack{forced, full}, Request{TrackIndex: 0})
+	if err != nil || got.SubIndex != 0 {
+		t.Fatalf("explicit forced track: got s:%v err=%v, want s:0", got, err)
+	}
+
+	// If the only text track is forced, fall back to it rather than nothing.
+	got, err = selectTrack([]probe.SubTrack{forcedText(0)}, Request{TrackIndex: -1})
+	if err != nil || got.SubIndex != 0 {
+		t.Fatalf("sole forced text track: got %v err=%v, want s:0", got, err)
+	}
+}
 
 func TestDecide(t *testing.T) {
 	tests := []struct {

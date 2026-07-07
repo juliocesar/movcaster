@@ -42,6 +42,7 @@ type SubTrack struct {
 	Language string
 	Title    string
 	Default  bool
+	Forced   bool // disposition forced: only covers foreign-dialogue lines, a poor default
 }
 
 // MediaInfo summarizes a probed file.
@@ -121,6 +122,7 @@ func Probe(ctx context.Context, path string) (*MediaInfo, error) {
 				Language: s.Tags["language"],
 				Title:    s.Tags["title"],
 				Default:  s.Disposition["default"] == 1,
+				Forced:   s.Disposition["forced"] == 1,
 			}
 			mi.Subtitles = append(mi.Subtitles, t)
 			subSeq++

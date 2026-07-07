@@ -143,6 +143,9 @@ func (p *Preparation) DescribeStreams() string {
 			if s.Default {
 				def = " (default)"
 			}
+			if s.Forced {
+				def += " (forced)"
+			}
 			fmt.Fprintf(&b, "    s:%d  %-18s %-7s %s %s%s\n", s.SubIndex, s.Codec, s.Kind, s.Language, s.Title, def)
 		}
 	}
