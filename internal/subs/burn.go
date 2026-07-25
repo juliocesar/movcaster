@@ -18,9 +18,22 @@ import (
 // a new ss on scrub. Bitmap tracks use the overlay filter; text tracks use the
 // subtitles filter.
 func BurnArgs(input string, track probe.SubTrack, ss time.Duration) []string {
+	// The subtitles filter opens the file with its own demuxer and reads absolute
+	// cue times, so it ignores -ss: input-seeking rebases frame timestamps to 0
+	// while the cues stay absolute, and every cue lands in the "past" — the burn
+	// silently renders nothing. Keeping absolute timestamps (-copyts) lets the
+	// filter match, then setpts/asetpts rebase both streams for the muxer, which
+	// is what a fragmented-MP4-from-0 stream needs. The bitmap overlay path takes
+	// its subtitle from the demuxer, which *does* honor -ss, so it needs none of
+	// this and is left exactly as it was.
+	textSeek := track.Kind != probe.SubBitmap && ss > 0
+
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
 	if ss > 0 {
 		args = append(args, "-ss", fmt.Sprintf("%.3f", ss.Seconds()))
+	}
+	if textSeek {
+		args = append(args, "-copyts")
 	}
 	args = append(args, "-i", input)
 
@@ -32,9 +45,15 @@ func BurnArgs(input string, track probe.SubTrack, ss time.Duration) []string {
 		// Render text subtitles via libass. The filename must be escaped for the
 		// filter-graph parser.
 		vf := fmt.Sprintf("subtitles='%s':si=%d", escapeFilterPath(input), track.SubIndex)
+		if textSeek {
+			vf += ",setpts=PTS-STARTPTS"
+		}
 		args = append(args, "-vf", vf, "-map", "0:v:0")
 	}
 	args = append(args, "-map", "0:a:0?", "-dn", "-map_chapters", "-1")
+	if textSeek {
+		args = append(args, "-af", "asetpts=PTS-STARTPTS")
+	}
 
 	args = append(args,
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",

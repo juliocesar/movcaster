@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -464,7 +466,7 @@ func TestApplySubtitlesBurn(t *testing.T) {
 	track := probe.SubTrack{SubIndex: 1, Codec: "hdmv_pgs_subtitle", Kind: probe.SubBitmap}
 	dec := subs.Decision{Kind: subs.Burn, Track: &track}
 
-	label, build, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0)
+	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,7 +489,7 @@ func TestApplySubtitlesSidecar(t *testing.T) {
 	media := &renderer.Media{}
 	dec := subs.Decision{Kind: subs.SoftSidecar, SidecarPath: "/x/movie.srt"}
 
-	label, build, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0)
+	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,7 +510,7 @@ func TestApplySubtitlesSidecar(t *testing.T) {
 func TestApplySubtitlesNone(t *testing.T) {
 	s := &fakeServer{}
 	media := &renderer.Media{Seekable: true}
-	label, build, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), subs.Decision{Kind: subs.None}, 0)
+	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), subs.Decision{Kind: subs.None}, 0, 0)
 	if err != nil || label != "" || build != nil {
 		t.Fatalf("None: label=%q build!=nil=%v err=%v", label, build != nil, err)
 	}
@@ -532,7 +534,7 @@ func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
 	off := SubtitleOptions{NoSubs: true, TrackIndex: -1}
 
 	assertSoft := func() {
-		_, build, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, soft, false, 0)
+		_, build, _, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, soft, false, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -550,7 +552,7 @@ func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
 	assertSoft()
 
 	// soft -> burn: media flips to non-seekable mp4 with subs cleared, build set.
-	_, build, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, burn, false, 30*time.Second)
+	_, build, _, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, burn, false, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,7 +567,7 @@ func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
 	}
 
 	// burn -> off: back to a clean direct-play baseline, no subs, no transcode.
-	_, build, err = a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, off, false, 0)
+	_, build, _, err = a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, off, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -795,5 +797,50 @@ func TestSetEventSinkRoutesEvents(t *testing.T) {
 	a.emit(Info, "hello %s", "tv")
 	if len(got) != 1 || got[0] != "hello tv" {
 		t.Fatalf("routed events = %v, want [hello tv]", got)
+	}
+}
+
+// A transcoded stream is rebased to start at 0, so soft subs riding along with a
+// codec transcode must be re-cut from the same offset — otherwise every cue runs
+// `ss` late, which looks exactly like "no subtitles". Direct-play keeps the file's
+// absolute timeline and must NOT be shifted.
+func TestSoftSubOffsetFollowsTranscode(t *testing.T) {
+	sidecar := filepath.Join(t.TempDir(), "movie.srt")
+	if err := os.WriteFile(sidecar, []byte("1\n00:02:00,000 --> 00:02:02,000\nhi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	soft := SubtitleOptions{Sidecar: sidecar, TrackIndex: -1}
+
+	// av1 => codec transcode; the sidecar must be shifted by the 85s start offset.
+	a := New(Options{})
+	s := &fakeServer{}
+	media := &renderer.Media{}
+	_, build, resoft, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(),
+		&probe.MediaInfo{VideoCodec: "av1", AudioCodec: "eac3"}, soft, false, 85*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if build == nil {
+		t.Fatal("av1 must transcode")
+	}
+	if resoft == nil {
+		t.Fatal("soft subs on a transcode must expose a rebase hook for seeks")
+	}
+	if s.subPath == sidecar {
+		t.Error("transcode: sidecar served unshifted, cues would run 85s late")
+	}
+
+	// h264 => direct-play; the sidecar must be served as-is.
+	s2 := &fakeServer{}
+	_, build2, _, err := a.buildDelivery(s2, &renderer.Media{}, "/x/movie.mkv", t.TempDir(),
+		&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "eac3"}, soft, false, 85*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if build2 != nil {
+		t.Fatal("h264 must direct-play")
+	}
+	if s2.subPath != sidecar {
+		t.Errorf("direct-play must serve the sidecar unshifted, got %q", s2.subPath)
 	}
 }

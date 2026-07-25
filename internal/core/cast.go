@@ -30,7 +30,11 @@ type Cast struct {
 	// Transcode mode: buildArgs(ss) yields the ffmpeg args to start playback at
 	// absolute offset ss. nil => direct-play.
 	buildArgs func(ss time.Duration) []string
-	media     renderer.Media
+	// resoft re-prepares soft subs for a transcode segment starting at ss (nil when
+	// the delivery has none to rebase). Seek must call it: a seek-restart rebases
+	// the stream to 0, so the cue times have to be rebased to match.
+	resoft softSubFn
+	media  renderer.Media
 
 	// UI metadata.
 	title   string
@@ -235,6 +239,18 @@ func (c *Cast) Seek(ctx context.Context, pos time.Duration) error {
 	c.srv.SetTranscode(build(pos))
 	c.media.URL = c.srv.MediaURL()
 
+	// The restart rebases the stream to 0, so re-cut the soft subtitle from pos;
+	// otherwise every cue runs pos late (i.e. effectively no subtitles). Serving a
+	// fresh URL is what makes the TV re-fetch instead of reusing the old cues.
+	// Best-effort: a subtitle failure must not cost the user the seek itself.
+	if c.resoft != nil {
+		rctx, rcancel := context.WithTimeout(ctx, 45*time.Second)
+		if err := c.resoft(rctx, pos, &c.media); err != nil {
+			c.app.emit(Warn, "subtitles after seek: %v", err)
+		}
+		rcancel()
+	}
+
 	if err := retrySOAP(ctx, 3, 9*time.Second, func(ic context.Context) error {
 		return c.r.SetMedia(ic, c.media)
 	}); err != nil {
@@ -377,7 +393,7 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 	// not the raw --sub flag. It is silent, so Start reports the outcome itself.
 	subOpts := req.Subtitle
 	subOpts.Sidecar = prep.Sidecar
-	label, build, err := a.buildDelivery(srv, &media, abs, tmpDir, prep.Info, subOpts, req.ForceTranscode, startOffset)
+	label, build, resoft, err := a.buildDelivery(srv, &media, abs, tmpDir, prep.Info, subOpts, req.ForceTranscode, startOffset)
 	if err != nil {
 		_ = srv.Shutdown(context.Background())
 		_ = os.RemoveAll(tmpDir)
@@ -414,6 +430,7 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		media:         media,
 		knownDuration: knownDur,
 		buildArgs:     build,
+		resoft:        resoft,
 		title:         filepath.Base(abs),
 		device:        dev.FriendlyName,
 		subInfo:       label,
@@ -484,7 +501,7 @@ func applyTranscode(srv MediaServer, media *renderer.Media, build func(time.Dura
 // mode flips: each call re-establishes the baseline before applying.
 func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir string,
 	info *probe.MediaInfo, sub SubtitleOptions, forceTranscode bool, ss time.Duration,
-) (label string, build func(time.Duration) []string, err error) {
+) (label string, build func(time.Duration) []string, resoft softSubFn, err error) {
 
 	// Baseline: direct-play the original file, no subs.
 	srv.SetDirectPlay(abs, mimeForExt(abs))
@@ -497,77 +514,132 @@ func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir 
 		MuxSoftTry: sub.MuxSoft, TrackIndex: sub.TrackIndex,
 	})
 	if derr != nil {
-		return "", nil, derr
+		return "", nil, nil, derr
 	}
 
-	label, build, err = applySubtitles(srv, media, abs, tmpDir, dec, ss)
+	// The codec plan has to be known *before* the subtitles are prepared: a
+	// transcoded stream is rebased to start at 0, so soft cue times must be
+	// rebased by the same ss to stay in step (direct-play keeps the file's own
+	// absolute timeline, so it stays at 0).
+	plan := codecPlan(info, forceTranscode)
+	subOffset := time.Duration(0)
+	if plan.Kind == TranscodeCodec {
+		subOffset = ss
+	}
+
+	label, build, resoft, err = applySubtitles(srv, media, abs, tmpDir, dec, ss, subOffset)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 
 	// Codec-compatibility fallback: only when subs didn't already force a transcode.
-	if build == nil {
-		plan := codecPlan(info, forceTranscode)
-		if plan.Kind == TranscodeCodec {
-			build = func(s time.Duration) []string { return transcode.Args(abs, s, plan.Video, plan.Audio) }
-			if label == "" {
-				label = "transcode"
-			}
-			applyTranscode(srv, media, build, ss)
+	if build == nil && plan.Kind == TranscodeCodec {
+		build = func(s time.Duration) []string { return transcode.Args(abs, s, plan.Video, plan.Audio) }
+		if label == "" {
+			label = "transcode"
 		}
+		applyTranscode(srv, media, build, ss)
 	}
-	return label, build, nil
+	return label, build, resoft, nil
+}
+
+// softSubFn re-prepares the soft subtitle for a transcode segment starting at ss
+// and re-points the server + the given media at it. Seek calls it on every
+// seek-restart: the restart rebases the stream to 0, so the cue times must be
+// rebased too or the subtitles run ss late. nil when the delivery serves no
+// rebasable soft subs (direct-play, burn-in, or none).
+//
+// The media is a parameter rather than captured because Start hands buildDelivery
+// a local renderer.Media that is then *copied* into the Cast: a captured pointer
+// would keep updating the dead local, leaving the live DIDL pointing at the
+// previous segment's caption URL.
+type softSubFn func(ctx context.Context, ss time.Duration, media *renderer.Media) error
+
+// serveSoft points the server + media at an SRT and refreshes the caption URL.
+func serveSoft(srv MediaServer, media *renderer.Media, srtPath string) {
+	mime, typ := subKind(srtPath)
+	srv.SetSubtitle(srtPath, mime)
+	media.SubURL, media.SubMIME, media.SubType = srv.SubURL(), mime, typ
+}
+
+// clearSoft drops the caption reference (used when no cues remain after ss).
+func clearSoft(media *renderer.Media) {
+	media.SubURL, media.SubMIME, media.SubType = "", "", ""
 }
 
 // applySubtitles executes the chosen subtitle strategy against the server +
 // media metadata, returning a UI label and (for burn-in) a transcode-args
 // builder starting at offset ss. It is silent (no events, no prints) so the same
 // helper serves both the initial cast and a live switch.
-func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, dec subs.Decision, ss time.Duration) (label string, build func(time.Duration) []string, err error) {
+// subOffset is the offset the served cue times must be rebased by (0 to keep the
+// file's absolute timeline); see softSubFn.
+func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, dec subs.Decision, ss, subOffset time.Duration) (label string, build func(time.Duration) []string, resoft softSubFn, err error) {
 	switch dec.Kind {
 	case subs.None:
-		return "", nil, nil
+		return "", nil, nil, nil
 
 	case subs.SoftSidecar:
-		mime, typ := subKind(dec.SidecarPath)
-		srv.SetSubtitle(dec.SidecarPath, mime)
-		media.SubURL, media.SubMIME, media.SubType = srv.SubURL(), mime, typ
-		label = "soft: " + filepath.Base(dec.SidecarPath)
-		return label, nil, nil
+		sidecar := dec.SidecarPath
+		resoft = func(ctx context.Context, at time.Duration, m *renderer.Media) error {
+			shifted, err := subs.ShiftText(ctx, sidecar, at, tmpDir)
+			if subs.NoCuesAfterOffset(err) {
+				clearSoft(m)
+				return nil
+			} else if err != nil {
+				return err
+			}
+			serveSoft(srv, m, shifted)
+			return nil
+		}
+		sctx, scancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer scancel()
+		if err := resoft(sctx, subOffset, media); err != nil {
+			return "", nil, nil, err
+		}
+		label = "soft: " + filepath.Base(sidecar)
+		return label, nil, resoft, nil
 
 	case subs.SoftExtract:
+		idx := dec.Track.SubIndex
+		resoft = func(ctx context.Context, at time.Duration, m *renderer.Media) error {
+			srt, err := subs.ExtractText(ctx, abs, idx, at, tmpDir)
+			if subs.NoCuesAfterOffset(err) {
+				clearSoft(m)
+				return nil
+			} else if err != nil {
+				return err
+			}
+			serveSoft(srv, m, srt)
+			return nil
+		}
 		ectx, ecancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer ecancel()
-		srt, err := subs.ExtractText(ectx, abs, dec.Track.SubIndex, tmpDir)
-		if err != nil {
-			return "", nil, err
+		if err := resoft(ectx, subOffset, media); err != nil {
+			return "", nil, nil, err
 		}
-		mime, typ := subKind(srt)
-		srv.SetSubtitle(srt, mime)
-		media.SubURL, media.SubMIME, media.SubType = srv.SubURL(), mime, typ
-		label = fmt.Sprintf("soft: embedded track %d", dec.Track.SubIndex)
-		return label, nil, nil
+		label = fmt.Sprintf("soft: embedded track %d", idx)
+		return label, nil, resoft, nil
 
 	case subs.MuxSoft:
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		muxed, err := subs.MuxSoftRemux(ctx, abs, *dec.Track, tmpDir)
 		if err != nil {
-			return "", nil, err
+			return "", nil, nil, err
 		}
 		srv.SetDirectPlay(muxed, "video/x-matroska")
 		media.URL, media.MIME, media.Seekable = srv.MediaURL(), "video/x-matroska", true
 		label = fmt.Sprintf("mux-soft: track %d (toggle subs on the TV)", dec.Track.SubIndex)
-		return label, nil, nil
+		return label, nil, nil, nil
 
 	case subs.Burn:
 		track := *dec.Track
 		build = func(s time.Duration) []string { return subs.BurnArgs(abs, track, s) }
 		applyTranscode(srv, media, build, ss)
 		label = fmt.Sprintf("burn-in: track %d (%s)", dec.Track.SubIndex, dec.Track.Codec)
-		return label, build, nil
+		return label, build, nil, nil
 	}
-	return "", nil, nil
+	return "", nil, nil, nil
 }
 
 // subChoice is one entry in the live subtitle picker: a display label plus the
@@ -729,7 +801,7 @@ func (c *Cast) SetSubtitle(ctx context.Context, idx int) error {
 	}
 
 	choice := c.subChoices[idx]
-	label, build, err := c.app.buildDelivery(c.srv, &c.media, c.abs, c.tmpDir,
+	label, build, resoft, err := c.app.buildDelivery(c.srv, &c.media, c.abs, c.tmpDir,
 		c.info, choice.opts, c.forceTranscode, pos) // ss=pos => transcode starts at pos in one shot
 	if err != nil {
 		return err
@@ -746,6 +818,7 @@ func (c *Cast) SetSubtitle(ctx context.Context, idx int) error {
 
 	c.mu.Lock()
 	c.buildArgs = build
+	c.resoft = resoft
 	if build != nil {
 		c.ssOffset = pos
 	} else {

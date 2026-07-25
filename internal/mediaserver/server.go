@@ -34,10 +34,11 @@ type Server struct {
 	port     int
 	mediaExt string
 
-	mu    sync.RWMutex
-	src   Source
-	subs  *subtitle
-	token string // cache-buster, bumped on transcode (re)launch
+	mu       sync.RWMutex
+	src      Source
+	subs     *subtitle
+	token    string // cache-buster, bumped on transcode (re)launch
+	subToken string // cache-buster for /subs, bumped on every SetSubtitle
 }
 
 type subtitle struct {
@@ -56,7 +57,7 @@ func New(deviceHost string) (*Server, error) {
 		return nil, fmt.Errorf("bind media server: %w", err)
 	}
 	addr := ln.Addr().(*net.TCPAddr)
-	s := &Server{ln: ln, localIP: ip, port: addr.Port, token: "0"}
+	s := &Server{ln: ln, localIP: ip, port: addr.Port, token: "0", subToken: "0"}
 
 	// Route by prefix: media URLs carry the file extension (e.g. /media.mp4)
 	// and a cache-busting query, so exact-match patterns won't do.
@@ -116,10 +117,16 @@ func (s *Server) SetTranscode(args []string) {
 }
 
 // SetSubtitle exposes a local subtitle file (already in a TV-friendly text format).
+// The subtitle URL carries its own cache-busting token: a seek-restart re-cuts the
+// cues from the new offset, and the TV must re-fetch them instead of reusing the
+// previous segment's file.
 func (s *Server) SetSubtitle(path, mime string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.subs = &subtitle{path: path, mime: mime}
+	var n int
+	fmt.Sscanf(s.subToken, "%d", &n)
+	s.subToken = fmt.Sprintf("%d", n+1)
 }
 
 func (s *Server) bumpTokenLocked() {
@@ -154,7 +161,7 @@ func (s *Server) SubURL() string {
 		return ""
 	}
 	ext := strings.ToLower(filepath.Ext(s.subs.path))
-	return fmt.Sprintf("%s/subs%s", s.baseURL(), ext)
+	return fmt.Sprintf("%s/subs%s?t=%s", s.baseURL(), ext, s.subToken)
 }
 
 func setDLNAHeaders(w http.ResponseWriter, mime string, seekable bool) {
