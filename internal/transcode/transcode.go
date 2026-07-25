@@ -53,6 +53,10 @@ func Args(input string, ss time.Duration, transcodeVideo, transcodeAudio bool) [
 		args = append(args, "-c:a", "copy")
 	}
 
-	args = append(args, "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1")
+	// delay_moov is required whenever audio is copied: the MP4 muxer cannot write
+	// the moov atom for (E-)AC-3 until it has parsed a packet, so with a bare
+	// empty_moov ffmpeg dies on "Cannot write moov atom before EAC3 packets
+	// parsed" and the TV gets an empty stream ("file cannot be recognized").
+	args = append(args, "-movflags", "+frag_keyframe+empty_moov+default_base_moof+delay_moov", "-f", "mp4", "pipe:1")
 	return args
 }

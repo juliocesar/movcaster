@@ -39,7 +39,7 @@ The TV pulls media from our HTTP server; we push control via SOAP to the TV. Two
 independent channels.
 
 Planning (`--info`) reuses `core.Prepare` alone (no device, no TV): probe + decide,
-then `Preparation.DescribeStreams()` / `DescribeStrategy()` render the text.
+then `Preparation.DescribeStreams()` / `DescribeStrategy()` / `DescribeCodec()` render the text.
 
 ---
 
@@ -61,7 +61,7 @@ orchestration logic.
   outside a cast (`-l`, `--info`, "Resuming:", "Up next:"); during a cast the sink is
   swapped to the TUI (below) so nothing prints under bubbletea.
 - `runList(app)` — `-l`: `app.ListDevices` + print.
-- `runInfo(app, req)` — `--info`: `app.Prepare` then print `DescribeStreams`/`DescribeStrategy`.
+- `runInfo(app, req)` — `--info`: `app.Prepare` then print `DescribeStreams`/`DescribeStrategy`/`DescribeCodec`.
   ProbeErr is fatal (matches old behavior: aborts before printing); DecideErr prints
   streams then errors.
 - `runCast(app, req, next, autoNext)` — loop: `tui.Start(base(file), startFn)` where
@@ -94,8 +94,10 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
   instead of silently degrading mid-cast). Was `ensureFFmpeg`.
 - `ListDevices(ctx)` — discovery passthrough.
 - `Prepare(ctx, CastRequest) → *Preparation` — pure planning: probe + `subs.Decide`, no
-  TV/network I/O. `Preparation{AbsPath, Info, Sidecar, Strategy, ProbeErr, DecideErr}` +
-  `DescribeStreams()`/`DescribeStrategy()`. Reused by `--info` and `Start`.
+  TV/network I/O. `Preparation{AbsPath, Info, Sidecar, Strategy, Codec, ProbeErr, DecideErr}` +
+  `DescribeStreams()`/`DescribeStrategy()`/`DescribeCodec()`. `Codec` is the `codecPlan` result
+  (needs no TV), so `--info` reports a codec-compat transcode; `Start` recomputes it since a
+  burn-in strategy supersedes it. Reused by `--info` and `Start`.
 - `Start(ctx, CastRequest) → (*Cast, *Preparation)` — resolve device (emit "Casting to",
   save config), bind server, `applySubtitles`, codec fallback (`codecPlan`), then
   `setTransportURI` (Stop→settle→retry SetURI) *synchronously* and return the `Cast`;
@@ -223,6 +225,7 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 - `Needs(info) (video,audio bool)` — true if codec outside `goodVideo`/`goodAudio` allowlists
   (good video: h264/hevc/mpeg4/mpeg2video/vc1/msmpeg4v3; good audio: aac/ac3/eac3/mp3/mp2/dts/flac).
 - `Args(input,ss,tV,tA) []string` — like BurnArgs minus subs; copies stream if not transcoding it.
+  Adds `+delay_moov` to the movflags — mandatory whenever audio is copied (see gotchas).
 
 > The seek brain (former `internal/cast.Session`) now lives in `internal/core` as
 > `Cast` — see the core section above. The `internal/cast` package was removed.
@@ -315,6 +318,14 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 - **Media URLs carry ext + `?t=token`** → server uses prefix routing, NOT exact mux patterns.
 - **Transcode = `empty_moov` fragmented MP4 → no in-stream duration.** Must advertise
   `res@duration` in DIDL or the TV's seek bar races. (Verified: TV then reports full duration.)
+- **A copied audio stream needs `+delay_moov` in the fragmented MP4.** The mp4 muxer cannot
+  write the moov atom for (E-)AC-3 before it has parsed a packet, so with a bare `empty_moov`
+  ffmpeg aborts on "Cannot write moov atom before EAC3 packets parsed", writes nothing, and
+  the TV shows "This file cannot be recognized". This only bites the codec-compat path
+  (`transcode.Args`, which copies audio when it's already TV-friendly) — `BurnArgs` always
+  re-encodes to aac and never hit it. Verified per codec: ac3/eac3 fail without `delay_moov`;
+  aac/mp3/mp2/flac are fine either way; all pass with it, and 5.1 E-AC-3 survives intact.
+  Triggered by AV1 releases (AV1 ∉ `goodVideo`, eac3 ∈ `goodAudio` → transcode video, copy audio).
 - **Transcode streams are NOT byte-seekable** → seeking = kill+relaunch ffmpeg at `-ss`
   (seek-restart). Direct-play keeps native range seeking.
 - **TVs serialize UPnP control & are flaky mid-transition** → pause polling during a seek;

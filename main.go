@@ -255,6 +255,7 @@ func runInfo(app *core.App, req core.CastRequest) error {
 		return prep.DecideErr
 	}
 	fmt.Print(prep.DescribeStrategy())
+	fmt.Print(prep.DescribeCodec())
 	return nil
 }
 

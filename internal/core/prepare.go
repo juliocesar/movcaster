@@ -58,6 +58,7 @@ type Preparation struct {
 	Info      *probe.MediaInfo // nil if probe failed (see ProbeErr)
 	Sidecar   string           // resolved sidecar/--sub path, or ""
 	Strategy  subs.Decision    // valid only if DecideErr == nil
+	Codec     TranscodePlan    // codec-compatibility need (subs may override at Start)
 	ProbeErr  error            // non-fatal for casting, fatal for --info
 	DecideErr error            // subtitle strategy error (e.g. --soft on bitmap)
 }
@@ -85,6 +86,8 @@ func (a *App) Prepare(ctx context.Context, req CastRequest) (*Preparation, error
 	} else {
 		p.Info = info
 	}
+
+	p.Codec = codecPlan(p.Info, req.ForceTranscode)
 
 	dec, derr := subs.Decide(subs.Request{
 		Info:        p.Info,
@@ -158,6 +161,23 @@ func (p *Preparation) DescribeStreams() string {
 // DescribeStrategy renders the chosen-subtitle-strategy line `--info` prints.
 func (p *Preparation) DescribeStrategy() string {
 	return fmt.Sprintf("  -> strategy: %s  (%s)\n", p.Strategy.Kind, p.Strategy.Reason)
+}
+
+// DescribeCodec renders the codec-compatibility line `--info` prints, or "" when
+// the file direct-plays. A burn-in strategy transcodes anyway, so the streams
+// listed here are the ones that would be re-encoded on top of the burn.
+func (p *Preparation) DescribeCodec() string {
+	if p.Codec.Kind != TranscodeCodec {
+		return ""
+	}
+	var what []string
+	if p.Codec.Video {
+		what = append(what, "video "+p.Info.VideoCodec)
+	}
+	if p.Codec.Audio {
+		what = append(what, "audio "+p.Info.AudioCodec)
+	}
+	return fmt.Sprintf("  -> transcode: %s not supported by the renderer\n", strings.Join(what, " + "))
 }
 
 // codecPlan computes the codec-compatibility transcode need (no subs involved).
