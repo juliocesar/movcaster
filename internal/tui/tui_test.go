@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -422,5 +423,124 @@ func TestFmtDur(t *testing.T) {
 		if got := fmtDur(in); got != want {
 			t.Errorf("fmtDur(%v) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestScrollFor(t *testing.T) {
+	cases := []struct {
+		name                           string
+		cursor, scroll, visible, total int
+		want                           int
+	}{
+		{"everything fits", 5, 0, 10, 8, 0},
+		{"cursor above window scrolls up", 2, 5, 5, 40, 2},
+		{"cursor below window scrolls down", 9, 0, 5, 40, 5},
+		{"cursor inside window holds still", 3, 2, 5, 40, 2},
+		{"clamped at the end", 39, 38, 5, 40, 35},
+		{"never negative", 0, -3, 5, 40, 0},
+	}
+	for _, c := range cases {
+		if got := scrollFor(c.cursor, c.scroll, c.visible, c.total); got != c.want {
+			t.Errorf("%s: scrollFor(%d,%d,%d,%d) = %d, want %d",
+				c.name, c.cursor, c.scroll, c.visible, c.total, got, c.want)
+		}
+	}
+}
+
+// A 40-track release must not blow past the terminal: only a window is drawn, and
+// the active track is on screen when the picker opens.
+func TestSubMenuScrollsLongList(t *testing.T) {
+	choices := make([]string, 44)
+	for i := range choices {
+		choices[i] = fmt.Sprintf("Track s:%d", i)
+	}
+	choices[43] = "Off"
+	f := &fakeSubCtrl{choices: choices, active: 30}
+
+	m := model{ctrl: f, state: "PLAYING", width: 100, height: 24,
+		prog: progress.New(progress.WithWidth(50))}
+	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = mi.(model)
+	if !m.subMenuOpen {
+		t.Fatal("picker did not open")
+	}
+
+	view := m.View()
+	rows := 0
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, "Track s:") {
+			rows++
+		}
+	}
+	if rows >= len(choices) {
+		t.Errorf("drew %d rows of %d — the list is not windowed", rows, len(choices))
+	}
+	if rows > m.subVisibleRows() {
+		t.Errorf("drew %d rows, window is %d", rows, m.subVisibleRows())
+	}
+	// The active track must be visible on open, not scrolled off.
+	if !strings.Contains(view, "Track s:30") {
+		t.Errorf("active track 30 not visible on open:\n%s", view)
+	}
+	if !strings.Contains(view, "● active") {
+		t.Error("active marker missing")
+	}
+	// Header shows position, footer shows what is off-screen.
+	if !strings.Contains(view, "31/44") {
+		t.Errorf("missing position counter:\n%s", view)
+	}
+	if !strings.Contains(view, "more") {
+		t.Errorf("missing off-screen indicator:\n%s", view)
+	}
+}
+
+// End jumps to the last entry (Off) and the window follows it.
+func TestSubMenuJumpToEnd(t *testing.T) {
+	choices := make([]string, 44)
+	for i := range choices {
+		choices[i] = fmt.Sprintf("Track s:%d", i)
+	}
+	choices[43] = "Off"
+	f := &fakeSubCtrl{choices: choices, active: 0}
+	m := model{ctrl: f, state: "PLAYING", width: 100, height: 24,
+		prog: progress.New(progress.WithWidth(50))}
+	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = mi.(model)
+	mi, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	m = mi.(model)
+
+	if m.subCursor != 43 {
+		t.Fatalf("cursor = %d, want 43", m.subCursor)
+	}
+	if !strings.Contains(m.View(), "> Off") {
+		t.Errorf("Off not visible after jumping to the end:\n%s", m.View())
+	}
+}
+
+// Paging moves by a screenful without running off either end.
+func TestSubMenuPagingStaysInBounds(t *testing.T) {
+	choices := make([]string, 44)
+	for i := range choices {
+		choices[i] = fmt.Sprintf("Track s:%d", i)
+	}
+	f := &fakeSubCtrl{choices: choices, active: 0}
+	m := model{ctrl: f, state: "PLAYING", width: 100, height: 24,
+		prog: progress.New(progress.WithWidth(50))}
+	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = mi.(model)
+
+	for i := 0; i < 20; i++ {
+		mi, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		m = mi.(model)
+	}
+	if m.subCursor != 43 {
+		t.Errorf("paging down past the end: cursor = %d, want 43", m.subCursor)
+	}
+	for i := 0; i < 20; i++ {
+		mi, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+		m = mi.(model)
+	}
+	if m.subCursor != 0 {
+		t.Errorf("paging up past the start: cursor = %d, want 0", m.subCursor)
 	}
 }

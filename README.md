@@ -110,6 +110,10 @@ Press `s` to open a subtitle picker: it lists every embedded track, any sidecar
 file, and **Off**. Pick one and movcaster re-points the TV at a freshly built
 stream and resumes where you were (text tracks go soft, bitmap tracks burn in).
 
+The picker opens on the track that's currently active and scrolls, which matters
+for releases that ship dozens of languages: `↑/↓` move a row, `pgup/pgdn` a
+screenful, `g`/`G` jump to the top and bottom, `enter` applies, `esc` cancels.
+
 ## All the flags
 
 ```

@@ -131,6 +131,7 @@ type model struct {
 	subMenuOpen bool
 	subChoices  []string
 	subCursor   int
+	subScroll   int // index of the first visible picker row (releases with 40+ tracks overflow)
 	switching   bool
 
 	// Connecting phase (Start): ctrl is nil until readyMsg adopts it, so every
@@ -141,6 +142,8 @@ type model struct {
 	statusLines []string
 	startErr    error
 	spinFrame   int
+
+	height int // terminal rows, for sizing the scrolling picker
 }
 
 // Options configure the view.
@@ -162,6 +165,7 @@ func Run(ctrl Controller, opts Options) (Outcome, error) {
 		hasVol:  opts.HasVolume,
 		state:   "...",
 		width:   60,
+		height:  24,
 		prog:    progress.New(progress.WithDefaultGradient(), progress.WithWidth(50)),
 	}
 	p := tea.NewProgram(m)
@@ -196,6 +200,7 @@ func Start(title string, startFn func(ctx context.Context, emit func(string)) (C
 		title:      title,
 		state:      "...",
 		width:      60,
+		height:     24, // replaced by the first WindowSizeMsg; a sane picker size until then
 		prog:       progress.New(progress.WithDefaultGradient(), progress.WithWidth(50)),
 	}
 	p := tea.NewProgram(m)
@@ -301,9 +306,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		if msg.Height > 0 {
+			m.height = msg.Height
+		}
 		w := msg.Width - 10
 		if w > 0 {
 			m.prog.Width = w
+		}
+		// A resize can leave the cursor outside the (now differently sized) window.
+		if m.subMenuOpen {
+			m.subScroll = scrollFor(m.subCursor, m.subScroll, m.subVisibleRows(), len(m.subChoices))
 		}
 		return m, nil
 
@@ -460,6 +472,10 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.subChoices = sc.SubtitleChoices()
 			if len(m.subChoices) > 0 {
 				m.subCursor = sc.ActiveSubtitle()
+				// Open centred on the active track: with a 40-track release it would
+				// otherwise be scrolled off-screen.
+				vis := m.subVisibleRows()
+				m.subScroll = scrollFor(m.subCursor, m.subCursor-vis/2, vis, len(m.subChoices))
 				m.subMenuOpen = true
 			}
 		}
@@ -519,21 +535,33 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // handleSubMenuKey handles keystrokes while the subtitle picker is open. Up/Down
-// (k/j) move the cursor, Enter applies the highlighted choice (kicking off the
-// switch), Esc/s close without changing anything, and q/ctrl+c still quit.
+// (k/j) move the cursor one row, PgUp/PgDn (ctrl+u/ctrl+d) a screenful, Home/End
+// (g/G) jump to the ends, Enter applies the highlighted choice (kicking off the
+// switch), Esc/s close without changing anything, and q/ctrl+c still quit. The
+// visible window follows the cursor — a release can carry 40+ subtitle tracks,
+// which does not fit on screen.
 func (m model) handleSubMenuKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	last := len(m.subChoices) - 1
+	page := m.subVisibleRows()
+
 	switch msg.String() {
 	case "up", "k":
-		if m.subCursor > 0 {
-			m.subCursor--
-		}
-		return m, nil
+		m.subCursor--
 
 	case "down", "j":
-		if m.subCursor < len(m.subChoices)-1 {
-			m.subCursor++
-		}
-		return m, nil
+		m.subCursor++
+
+	case "pgup", "ctrl+u":
+		m.subCursor -= page
+
+	case "pgdown", "ctrl+d":
+		m.subCursor += page
+
+	case "home", "g":
+		m.subCursor = 0
+
+	case "end", "G":
+		m.subCursor = last
 
 	case "esc", "s":
 		m.subMenuOpen = false
@@ -559,8 +587,42 @@ func (m model) handleSubMenuKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.quitting = true
 		m.outcome = OutcomeQuit
 		return m, tea.Sequence(actionCmd(m.ctrl.Stop), tea.Quit)
+
+	default:
+		return m, nil // swallow other keys while the menu is open
 	}
-	return m, nil // swallow other keys while the menu is open
+
+	// A movement key landed here: clamp the cursor, then scroll to follow it.
+	m.subCursor = clamp(m.subCursor, 0, last)
+	m.subScroll = scrollFor(m.subCursor, m.subScroll, page, len(m.subChoices))
+	return m, nil
+}
+
+// subVisibleRows is how many picker rows fit on screen, leaving room for the
+// header/progress/status chrome above and the hint + scroll-indicator lines below.
+func (m model) subVisibleRows() int {
+	const chrome = 11
+	n := m.height - chrome
+	if n < 3 {
+		n = 3 // always show a usable sliver, even in a tiny terminal
+	}
+	return n
+}
+
+// scrollFor returns the first-visible index that keeps cursor on screen: it only
+// moves when the cursor would fall outside the window, so the list stays put
+// while paging through the middle of it.
+func scrollFor(cursor, scroll, visible, total int) int {
+	if visible >= total {
+		return 0
+	}
+	if cursor < scroll {
+		scroll = cursor
+	}
+	if cursor >= scroll+visible {
+		scroll = cursor - visible + 1
+	}
+	return clamp(scroll, 0, total-visible)
 }
 
 var (
@@ -651,18 +713,36 @@ func (m model) viewConnecting() string {
 }
 
 // renderSubMenu renders the subtitle picker overlay: one row per choice, the
-// cursor marked with ">", and the currently active track tagged.
+// cursor marked with ">", and the currently active track tagged. Only the visible
+// window is drawn (see subVisibleRows) — a release can carry 40+ tracks — with a
+// counter in the header and a footer showing how many rows are off-screen.
 func (m model) renderSubMenu() string {
 	active := -1
 	if sc, ok := m.ctrl.(SubtitleController); ok {
 		active = sc.ActiveSubtitle()
 	}
+	total := len(m.subChoices)
+	visible := m.subVisibleRows()
+	// Clamp defensively: View must not depend on Update having already fixed the
+	// offset (e.g. the very first frame, before any resize or keystroke).
+	start := scrollFor(m.subCursor, m.subScroll, visible, total)
+	end := start + visible
+	if end > total {
+		end = total
+	}
+
 	var b strings.Builder
-	b.WriteString(" " + dimStyle.Render("Subtitles  (↑/↓ select · enter apply · esc cancel)") + "\n")
-	for i, label := range m.subChoices {
-		row := "    " + label
+	head := "Subtitles  (↑/↓ select · enter apply · esc cancel)"
+	if total > visible {
+		head = fmt.Sprintf("Subtitles  (↑/↓ select · pgup/pgdn page · g/G ends · enter apply · esc cancel)   %d/%d",
+			m.subCursor+1, total)
+	}
+	b.WriteString(" " + dimStyle.Render(head) + "\n")
+
+	for i := start; i < end; i++ {
+		row := "    " + m.subChoices[i]
 		if i == m.subCursor {
-			row = "  > " + label
+			row = "  > " + m.subChoices[i]
 		}
 		if i == active {
 			row += "   ● active"
@@ -673,6 +753,17 @@ func (m model) renderSubMenu() string {
 			b.WriteString(dimStyle.Render(row))
 		}
 		b.WriteString("\n")
+	}
+
+	if total > visible {
+		var parts []string
+		if start > 0 {
+			parts = append(parts, fmt.Sprintf("↑ %d more", start))
+		}
+		if end < total {
+			parts = append(parts, fmt.Sprintf("↓ %d more", total-end))
+		}
+		b.WriteString("    " + dimStyle.Render(strings.Join(parts, "   ")) + "\n")
 	}
 	return b.String()
 }

@@ -93,6 +93,9 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
   but-broken binary, e.g. a dangling Homebrew dylib, fails here with an actionable hint
   instead of silently degrading mid-cast). Was `ensureFFmpeg`.
 - `ListDevices(ctx)` — discovery passthrough.
+- `buildDelivery(...) → (label, build, resoft, err)` — baseline direct-play, then
+  `subs.Decide` + `codecPlan` (computed *before* subtitles, since a transcode dictates the
+  sub offset) + `applySubtitles`. `resoft` is the `softSubFn` `Seek`/`SetSubtitle` re-run.
 - `Prepare(ctx, CastRequest) → *Preparation` — pure planning: probe + `subs.Decide`, no
   TV/network I/O. `Preparation{AbsPath, Info, Sidecar, Strategy, Codec, ProbeErr, DecideErr}` +
   `DescribeStreams()`/`DescribeStrategy()`/`DescribeCodec()`. `Codec` is the `codecPlan` result
@@ -217,15 +220,21 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 - `BurnArgs(input,track,ss) []string` (burn.go) — fragmented-mp4-on-pipe ffmpeg. Bitmap:
   `[0:v][0:s:N]overlay`. Text: `subtitles=…:si=N`. `-c:v libx264 -preset veryfast -crf 22`,
   aac, `-movflags +frag_keyframe+empty_moov+default_base_moof`, `-dn -map_chapters -1`. `ss`=input seek.
-- `ExtractText(ctx,input,subIndex,destDir) → srtPath` (extract.go) — `-map 0:s:N -c:s subrip -f srt`.
+- `ExtractText(ctx,input,subIndex,ss,destDir) → srtPath` (extract.go) — `-map 0:s:N -c:s subrip -f srt`.
   SRT, not WebVTT: webOS's `sec:CaptionInfoEx` renders SRT reliably but not VTT over DLNA.
+  `ss` input-seeks the extraction so the cues are rebased onto a transcode's 0-based
+  timeline (0 for direct-play). Seeking past the last cue returns `NoCuesAfterOffset(err)`,
+  which callers treat as "no soft subs for this segment", not as a failure.
+- `ShiftText(ctx,srtPath,ss,destDir) → srtPath` (extract.go) — same rebasing for an external
+  sidecar; `ss == 0` returns the input untouched.
 - `MuxSoftRemux(ctx,input,track,destDir) → mkvPath` (burn.go) — `-c copy` remux of v+a+sub (experimental 6a).
 
 ### `internal/transcode` — codec-compat transcode (no subs)
 - `Needs(info) (video,audio bool)` — true if codec outside `goodVideo`/`goodAudio` allowlists
   (good video: h264/hevc/mpeg4/mpeg2video/vc1/msmpeg4v3; good audio: aac/ac3/eac3/mp3/mp2/dts/flac).
 - `Args(input,ss,tV,tA) []string` — like BurnArgs minus subs; copies stream if not transcoding it.
-  Adds `+delay_moov` to the movflags — mandatory whenever audio is copied (see gotchas).
+  Adds `+delay_moov` (mandatory whenever audio is copied) and `-use_editlist 0` (webOS chokes
+  on the edit lists delay_moov then writes) — see gotchas.
 
 > The seek brain (former `internal/cast.Session`) now lives in `internal/core` as
 > `Cast` — see the core section above. The `internal/cast` package was removed.
@@ -260,12 +269,20 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 - Polling: `tickCmd` every 1s → `pollCmd` (Position+TransportState). **Skipped while `seeking`
   or `switching`** to avoid SOAP contention with a seek-restart / subtitle switch.
 - Subtitle picker: `s` opens an overlay listing the choices (cursor on the active one); ↑/↓
-  (k/j) move, enter applies (`SetSubtitle`, sets `switching` until `subDoneMsg`), esc/`s` cancel.
+  (k/j) move, pgup/pgdn (ctrl+u/ctrl+d) page, home/end (g/G) jump, enter applies
+  (`SetSubtitle`, sets `switching` until `subDoneMsg`), esc/`s` cancel.
+  **The list is windowed** — a WEB-DL can carry 65 subtitle tracks, far past the terminal.
+  `subVisibleRows()` = `height - 11` (min 3) rows; `subScroll` is the first visible index and
+  `scrollFor(cursor, scroll, visible, total)` moves it only when the cursor would leave the
+  window. The picker opens *centred* on the active track, the header shows `i/N`, and a footer
+  shows `↑ n more` / `↓ n more`. `View` re-clamps via `scrollFor` so a frame drawn before any
+  keystroke/resize is still correct; `WindowSizeMsg` re-clamps an open picker.
 - Seek debounce: arrow → `armSeek` moves displayed target + bumps `seekGen` + arms 1s `seekFireMsg`;
   only the matching `seekGen` fires the real `ctrl.Seek` (60s budget) → `seekDoneMsg`. Position
   polls don't overwrite the target while `seeking`.
 - Keys: space/p play-pause, ←→/hl seek 10s, ↑↓/kj volume ±5, m mute, s subtitle picker,
-  n next, q/ctrl+c stop+quit.
+  n next, q/ctrl+c stop+quit. `model.height` (from `WindowSizeMsg`, default 24) exists only to
+  size that picker.
 
 ### `internal/config` — persistence
 - `Config{LastDeviceHost}` at `os.UserConfigDir()/movcaster/config.json`. `Load`(zero on miss)/`Save`.
@@ -318,6 +335,27 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 - **Media URLs carry ext + `?t=token`** → server uses prefix routing, NOT exact mux patterns.
 - **Transcode = `empty_moov` fragmented MP4 → no in-stream duration.** Must advertise
   `res@duration` in DIDL or the TV's seek bar races. (Verified: TV then reports full duration.)
+- **A transcoded stream is rebased to 0, so soft cue times must be rebased too.**
+  `-ss T` before `-i` makes ffmpeg restart output timestamps at 0, but an extracted
+  SRT (or a sidecar) keeps the file's absolute times, so every cue runs T late — with a
+  resume or seek deep into a film that reads as "no subtitles at all". Input-seeking the
+  *extraction* (`ffmpeg -ss T -i in -map 0:s:N -c:s subrip`) rebases the cues identically
+  (verified: the cue at 40:01.500 comes out at 00:01.500 with the same text). Hence
+  `buildDelivery` computes `codecPlan` **before** applying subtitles, passes `ss` as the
+  sub offset only when the delivery is a transcode (direct-play keeps absolute times), and
+  hands back a `softSubFn` that `Seek` calls on every seek-restart. `/subs` carries its own
+  `?t=` token, bumped per `SetSubtitle`, so the TV re-fetches instead of reusing the
+  previous segment's cues (verified: `GET /subs.srt?t=1` then `?t=2` after a seek).
+- **`softSubFn` takes the `*renderer.Media` as a parameter, never a captured one.**
+  `Start` hands `buildDelivery` a local `renderer.Media` that is then *copied* into the
+  `Cast`; a captured pointer updates the dead local, so the live DIDL keeps advertising the
+  previous caption URL.
+- **The `subtitles` filter ignores `-ss`** — it opens the file with its own demuxer and reads
+  absolute cue times, so after an input seek every cue is in the past and the burn renders
+  *nothing* (verified: bottom-strip luma identical with and without the filter at `-ss 61`,
+  vs a clear delta unseeked). Fix is `-copyts` + `setpts=PTS-STARTPTS`/`-af asetpts=PTS-STARTPTS`.
+  The **bitmap overlay path takes its subtitle from the demuxer, which does honor `-ss`**, so
+  it must be left alone.
 - **A copied audio stream needs `+delay_moov` in the fragmented MP4.** The mp4 muxer cannot
   write the moov atom for (E-)AC-3 before it has parsed a packet, so with a bare `empty_moov`
   ffmpeg aborts on "Cannot write moov atom before EAC3 packets parsed", writes nothing, and
@@ -326,6 +364,10 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   re-encodes to aac and never hit it. Verified per codec: ac3/eac3 fail without `delay_moov`;
   aac/mp3/mp2/flac are fine either way; all pass with it, and 5.1 E-AC-3 survives intact.
   Triggered by AV1 releases (AV1 ∉ `goodVideo`, eac3 ∈ `goodAudio` → transcode video, copy audio).
+- **`delay_moov` starts emitting edit lists → suppress with `-use_editlist 0`.** webOS
+  mishandles them: after a pause the video freezes ~0.5s into the resume while audio keeps
+  playing. They encode nothing here (both streams already start at PTS 0; output
+  `start_time`/`start_pts` are identical with and without), so dropping them is free.
 - **Transcode streams are NOT byte-seekable** → seeking = kill+relaunch ffmpeg at `-ss`
   (seek-restart). Direct-play keeps native range seeking.
 - **TVs serialize UPnP control & are flaky mid-transition** → pause polling during a seek;
