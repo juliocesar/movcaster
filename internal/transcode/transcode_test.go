@@ -45,6 +45,25 @@ func TestArgsAlwaysDelaysMoov(t *testing.T) {
 	}
 }
 
+// delay_moov makes ffmpeg emit edit lists, which webOS mishandles (video freezes
+// on resume from pause while audio keeps playing), so they must stay suppressed.
+func TestArgsSuppressesEditLists(t *testing.T) {
+	for _, tv := range []bool{true, false} {
+		for _, ta := range []bool{true, false} {
+			args := Args("in.mkv", 0, tv, ta)
+			var found bool
+			for i, a := range args {
+				if a == "-use_editlist" && i+1 < len(args) && args[i+1] == "0" {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("Args(video=%v audio=%v) missing -use_editlist 0: %s", tv, ta, strings.Join(args, " "))
+			}
+		}
+	}
+}
+
 func TestArgsCodecSelection(t *testing.T) {
 	got := strings.Join(Args("in.mkv", 0, true, false), " ")
 	if !strings.Contains(got, "-c:v libx264") || !strings.Contains(got, "-c:a copy") {

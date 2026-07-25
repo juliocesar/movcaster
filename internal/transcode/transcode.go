@@ -57,6 +57,13 @@ func Args(input string, ss time.Duration, transcodeVideo, transcodeAudio bool) [
 	// the moov atom for (E-)AC-3 until it has parsed a packet, so with a bare
 	// empty_moov ffmpeg dies on "Cannot write moov atom before EAC3 packets
 	// parsed" and the TV gets an empty stream ("file cannot be recognized").
-	args = append(args, "-movflags", "+frag_keyframe+empty_moov+default_base_moof+delay_moov", "-f", "mp4", "pipe:1")
+	// delay_moov also starts emitting edit lists, which webOS mishandles (video
+	// freezes on resume while audio keeps going), so suppress them — they are
+	// no-ops here anyway: both streams already start at PTS 0, and the output's
+	// start_time/start_pts are identical with and without them.
+	args = append(args,
+		"-movflags", "+frag_keyframe+empty_moov+default_base_moof+delay_moov",
+		"-use_editlist", "0",
+		"-f", "mp4", "pipe:1")
 	return args
 }
