@@ -30,10 +30,10 @@ func (f *fakeCtrl) Position(context.Context) (time.Duration, time.Duration, erro
 func (f *fakeCtrl) PlayerState(context.Context) (engine.PlayerState, error) {
 	return engine.StatePlaying, nil
 }
-func (f *fakeCtrl) HasVolume() bool                                { return true }
-func (f *fakeCtrl) Volume(context.Context) (int, error)            { return 0, nil }
-func (f *fakeCtrl) SetVolume(context.Context, int) error           { return nil }
-func (f *fakeCtrl) Mute(context.Context, bool) error               { return nil }
+func (f *fakeCtrl) HasVolume() bool                      { return true }
+func (f *fakeCtrl) Volume(context.Context) (int, error)  { return 0, nil }
+func (f *fakeCtrl) SetVolume(context.Context, int) error { return nil }
+func (f *fakeCtrl) Mute(context.Context, bool) error     { return nil }
 
 // fakeSubCtrl adds live subtitle switching to fakeCtrl (satisfies SubtitleController).
 type fakeSubCtrl struct {

@@ -12,6 +12,14 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	src := s.src
 	s.mu.RUnlock()
 
+	// CORS preflight: a Cast receiver sends OPTIONS before ranged media reads
+	// when a subtitle track rides along.
+	if r.Method == http.MethodOptions {
+		setCommonHeaders(w, src.MIME)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if src.Transcode != nil {
 		s.serveTranscode(w, r, src.Transcode)
 		return
@@ -34,7 +42,8 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setDLNAHeaders(w, src.MIME, true)
+	setCommonHeaders(w, src.MIME)
+	setDLNAHeaders(w, true)
 	// ServeContent honors Range headers via the ReadSeeker -> native TV seeking.
 	http.ServeContent(w, r, fi.Name(), fi.ModTime(), f)
 }

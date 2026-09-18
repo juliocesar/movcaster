@@ -32,7 +32,8 @@ func (t *TranscodeSpec) stop() {
 // serveTranscode launches ffmpeg and streams its stdout to the TV. HTTP write
 // back-pressure naturally throttles ffmpeg (it blocks when the TV reads slowly).
 func (s *Server) serveTranscode(w http.ResponseWriter, r *http.Request, spec *TranscodeSpec) {
-	setDLNAHeaders(w, "video/mp4", false)
+	setCommonHeaders(w, "video/mp4")
+	setDLNAHeaders(w, false)
 	w.WriteHeader(http.StatusOK)
 
 	cmd := exec.CommandContext(r.Context(), "ffmpeg", spec.Args...)

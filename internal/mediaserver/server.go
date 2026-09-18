@@ -164,7 +164,23 @@ func (s *Server) SubURL() string {
 	return fmt.Sprintf("%s/subs%s?t=%s", s.baseURL(), ext, s.subToken)
 }
 
-func setDLNAHeaders(w http.ResponseWriter, mime string, seekable bool) {
+// setCommonHeaders sets CORS and the content type on every media/subs response.
+// A Cast receiver fetches subtitle tracks cross-origin, and when a LOAD carries
+// tracks Google requires CORS on BOTH the media and the track — including
+// Content-Type, Accept-Encoding and Range in Allow-Headers — or the LOAD fails
+// with an opaque error and no subtitles. Harmless to DLNA renderers.
+func setCommonHeaders(w http.ResponseWriter, mime string) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept-Encoding, Range")
+	if mime != "" {
+		w.Header().Set("Content-Type", mime)
+	}
+}
+
+// setDLNAHeaders adds the DLNA transfer hints. A Cast receiver ignores them, so
+// they are sent unconditionally rather than threading engine identity in here.
+func setDLNAHeaders(w http.ResponseWriter, seekable bool) {
 	op := "00"
 	flags := "01700000000000000000000000000000"
 	if seekable {
@@ -175,9 +191,6 @@ func setDLNAHeaders(w http.ResponseWriter, mime string, seekable bool) {
 	w.Header().Set("realTimeInfo.dlna.org", "DLNA.ORG_TLAG=*")
 	w.Header().Set("contentFeatures.dlna.org",
 		fmt.Sprintf("DLNA.ORG_OP=%s;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=%s", op, flags))
-	if mime != "" {
-		w.Header().Set("Content-Type", mime)
-	}
 }
 
 func (s *Server) handleSubs(w http.ResponseWriter, r *http.Request) {
@@ -188,14 +201,10 @@ func (s *Server) handleSubs(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+	setCommonHeaders(w, sub.mime)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
-	}
-	if sub.mime != "" {
-		w.Header().Set("Content-Type", sub.mime)
 	}
 	w.Header().Set("CaptionInfo.sec", s.SubURL())
 	http.ServeFile(w, r, sub.path)

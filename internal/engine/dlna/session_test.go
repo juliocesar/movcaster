@@ -60,8 +60,14 @@ func (f *fakeAV) PlayCtx(context.Context, uint32, string) error {
 	}
 	return nil
 }
-func (f *fakeAV) PauseCtx(context.Context, uint32) error { f.calls = append(f.calls, "Pause"); return nil }
-func (f *fakeAV) StopCtx(context.Context, uint32) error  { f.calls = append(f.calls, "Stop"); return nil }
+func (f *fakeAV) PauseCtx(context.Context, uint32) error {
+	f.calls = append(f.calls, "Pause")
+	return nil
+}
+func (f *fakeAV) StopCtx(context.Context, uint32) error {
+	f.calls = append(f.calls, "Stop")
+	return nil
+}
 func (f *fakeAV) SeekCtx(_ context.Context, _ uint32, _, target string) error {
 	f.calls = append(f.calls, "Seek")
 	f.seekedTo = target
