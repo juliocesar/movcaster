@@ -245,6 +245,9 @@ func (p *Preparation) DescribeCodec() string {
 		if p.Codec.Audio {
 			what = append(what, "audio "+p.Info.AudioCodec)
 		}
+		if p.Codec.Remux {
+			what = append(what, "container "+p.Info.Container)
+		}
 		return fmt.Sprintf("  -> transcode: %s not supported by the renderer\n", strings.Join(what, " + "))
 	case TranscodeRemux:
 		return fmt.Sprintf("  -> remux: container %s not supported by the renderer (streams copied)\n", p.Info.Container)
