@@ -7,10 +7,11 @@
 
 Throw a movie from your laptop onto the TV from the comfort of your terminal. 📺
 
-movcaster is a terminal-only (CLI + TUI) tool that streams local video to a DLNA
-renderer (built for an LG webOS TV) over wifi, with **soft** *and* **burned-in**
-subtitle support — including the bitmap subtitle tracks (VobSub/PGS/`dvd_subtitle`)
-that go2tv just shrugs at. No browser, no app, no cables. One binary.
+movcaster is a terminal-only (CLI + TUI) tool that streams local video to a TV
+over wifi — DLNA/webOS (grown against an LG TV) and Google Cast (Chromecast
+built-in / Google TV panels) — with **soft** *and* **burned-in** subtitle
+support, including the bitmap subtitle tracks (VobSub/PGS/`dvd_subtitle`) that
+go2tv just shrugs at. No browser, no app, no cables. One binary.
 
 Binge-friendly, too: it [auto-plays the next episode](#next-episode-automatically)
 in the folder when one ends, and casts a [playlist](#playlists) of files in order.
@@ -98,7 +99,9 @@ movcaster --playlist tonight.txt
 
 The first device you cast to is remembered (`~/.config/movcaster/config.json`),
 so plain `movcaster <file>` keeps finding your TV — even after it reboots and
-shuffles its DLNA port around.
+shuffles its DLNA port around. TVs of different families coexist: `-l` shows
+which engine (dlna, googlecast) owns each device, and `-t googlecast:<ip>`
+pins one explicitly.
 
 ### TUI controls
 
@@ -117,10 +120,12 @@ screenful, `g`/`G` jump to the top and bottom, `enter` applies, `esc` cancels.
 ## All the flags
 
 ```
-movcaster -l                       list DLNA renderers on the LAN
+movcaster -l                       list TVs on the LAN (with their engine)
 movcaster <file>                   cast (auto subtitles + auto codec fallback)
-movcaster <file> -t TARGET         target a device (IP, IP:port, or device URL)
+movcaster <file> -t TARGET         target a device (IP, IP:port, engine:host, or device URL)
+movcaster <file> --engine NAME     restrict to one engine (dlna, googlecast)
 movcaster <file> --info            print streams + the chosen subtitle strategy
+movcaster --probe-device [-t T]    measure what a device actually plays
 movcaster <file> --sub foo.srt     force an explicit soft subtitle
 movcaster <file> --sub-track N     pick embedded subtitle track N (see --info)
 movcaster <file> --burn            burn the selected subtitle into the video
@@ -138,11 +143,12 @@ movcaster --playlist list.txt      cast each file in a playlist, in order
 
 movcaster picks a strategy so you don't have to:
 
-1. A sidecar `.srt`/`.vtt` (or `--sub`) → **soft** subs via the DLNA caption
-   mechanism (`sec:CaptionInfoEx`). The TV draws them; size/style live in the TV's
-   caption settings.
-2. An embedded **text** track → extracted to SRT → **soft** (forced-only tracks are
-   skipped when picking the default, since they subtitle just foreign-dialogue scenes).
+1. A sidecar `.srt`/`.vtt` (or `--sub`) → **soft** subs in the format the TV
+   renders (SRT via `sec:CaptionInfoEx` on webOS, WebVTT tracks on Cast). The TV
+   draws them; size/style live in the TV's caption settings.
+2. An embedded **text** track → extracted → **soft**, same per-TV format
+   (forced-only tracks are skipped when picking the default, since they subtitle
+   just foreign-dialogue scenes).
 3. A **bitmap** track (`dvd_subtitle`/PGS/VobSub) → **burned in** on the fly with
    ffmpeg `overlay` (playback starts in seconds; no full pre-encode).
    `--mux-soft` instead remuxes it as a soft track to try the TV's own renderer.
@@ -204,9 +210,10 @@ the list is the running order.)
 
 ## Seeking
 
-Direct-play files seek natively via HTTP byte ranges. During a transcode (burn-in
-or codec fallback) the stream isn't byte-seekable, so a seek restarts ffmpeg at the
-new offset (`-ss`) and re-points the TV at the fresh stream. You scrub; it copes.
+Direct-play files seek natively via HTTP byte ranges. During a transcode (burn-in,
+codec fallback, or a container remux for Cast) the stream isn't byte-seekable, so a
+seek restarts ffmpeg at the new offset (`-ss`) and re-points the TV at the fresh
+stream. A remux copies both streams, so those restarts are fast. You scrub; it copes.
 
 ## Layout
 
@@ -216,9 +223,12 @@ and a future HTTP/GUI front-end would be too.
 ```
 main.go                  thin CLI: parse flags -> core.CastRequest -> render + drive TUI
 internal/core            the reusable API: plan a cast, start it, control it, tear it down
-internal/discovery       SSDP discovery (goupnp) -> Device + service clients
-internal/renderer        AVTransport + RenderingControl + DIDL-Lite building
-internal/mediaserver     local HTTP server (direct-play range + transcode pipe)
+internal/engine          the TV contract: Engine/Device/Session/Profile + registry
+internal/engine/dlna     the DLNA/webOS engine (SSDP, AVTransport, DIDL, quirks)
+internal/engine/googlecast  the Google Cast engine (mDNS, CASTV2 over TLS)
+internal/engine/all      registers every engine (a new TV family = one line here)
+internal/engine/enginetest  conformance suite + the no-cross-import architecture test
+internal/mediaserver     local HTTP server (direct-play range + transcode pipe, CORS)
 internal/probe           ffprobe wrapper + subtitle classification
 internal/subs            subtitle strategy + extract/burn/remux ffmpeg args
 internal/transcode       codec-compatibility transcode args
