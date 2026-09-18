@@ -48,7 +48,8 @@ type SubtitleOptions struct {
 // CastRequest fully describes a desired cast.
 type CastRequest struct {
 	File           string
-	Target         string // IP / IP:port / device URL / "" (auto + saved)
+	Target         string // IP / IP:port / engine:host / device URL / "" (auto + saved)
+	Engine         string // restrict discovery/resolution to one engine ("" = all)
 	Subtitle       SubtitleOptions
 	ForceTranscode bool
 }
@@ -79,19 +80,44 @@ type TranscodePlan struct {
 // Preparation is the result of planning a cast: probe + subtitle strategy. It
 // has no side effects on the TV and is reused by both `--info` and Start.
 type Preparation struct {
-	AbsPath   string
-	Info      *probe.MediaInfo // nil if probe failed (see ProbeErr)
-	Sidecar   string           // resolved sidecar/--sub path, or ""
-	Strategy  subs.Decision    // valid only if DecideErr == nil
-	Codec     TranscodePlan    // codec-compatibility need (subs may override at Start)
-	ProbeErr  error            // non-fatal for casting, fatal for --info
-	DecideErr error            // subtitle strategy error (e.g. --soft on bitmap)
+	AbsPath     string
+	Info        *probe.MediaInfo // nil if probe failed (see ProbeErr)
+	Sidecar     string           // resolved sidecar/--sub path, or ""
+	Strategy    subs.Decision    // valid only if DecideErr == nil
+	Codec       TranscodePlan    // codec/container need (subs may override at Start)
+	Profile     engine.Profile   // the profile the plan was made against
+	ProfileName string           // e.g. "dlna (webOS)", for --info output
+	ProbeErr    error            // non-fatal for casting, fatal for --info
+	DecideErr   error            // subtitle strategy error (e.g. --soft on bitmap)
 }
 
-// Prepare probes the file and decides the subtitle strategy. It performs no
-// network or TV I/O. A missing file is a hard error; a probe failure is recorded
-// in ProbeErr (callers choose severity); a strategy error in DecideErr.
+// Prepare probes the file and decides the subtitle strategy against a default
+// profile (the first registered engine's, so `--info` without -t reports what a
+// bare cast would most likely do). It performs no network or TV I/O; use
+// PrepareWithProfile when a real device's profile is known.
 func (a *App) Prepare(ctx context.Context, req CastRequest) (*Preparation, error) {
+	prof, name := planningProfile(req.Engine)
+	return a.PrepareWithProfile(ctx, req, prof, name)
+}
+
+// planningProfile picks the profile used when no device has been resolved: the
+// named engine's default, else the first registered engine's, else the built-in
+// webOS-shaped fallback (hermetic tests register no engines).
+func planningProfile(engineName string) (engine.Profile, string) {
+	if engineName != "" {
+		if e, ok := engine.Lookup(engineName); ok {
+			return e.DefaultProfile(), e.Name()
+		}
+	}
+	if es := engine.Engines(); len(es) > 0 {
+		return es[0].DefaultProfile(), es[0].Name()
+	}
+	return defaultProfile, ""
+}
+
+// PrepareWithProfile is Prepare against a specific device profile. engineName
+// is used only for reporting.
+func (a *App) PrepareWithProfile(ctx context.Context, req CastRequest, prof engine.Profile, engineName string) (*Preparation, error) {
 	abs, err := filepath.Abs(req.File)
 	if err != nil {
 		return nil, err
@@ -100,7 +126,15 @@ func (a *App) Prepare(ctx context.Context, req CastRequest) (*Preparation, error
 		return nil, fmt.Errorf("file: %w", err)
 	}
 
-	p := &Preparation{AbsPath: abs}
+	p := &Preparation{AbsPath: abs, Profile: prof}
+	if engineName != "" {
+		p.ProfileName = engineName
+		if prof.Name != "" {
+			p.ProfileName = fmt.Sprintf("%s (%s)", engineName, prof.Name)
+		}
+	} else if prof.Name != "" {
+		p.ProfileName = prof.Name
+	}
 	p.Sidecar = a.resolveSubtitle(abs, req.Subtitle.Sidecar)
 
 	pctx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -112,11 +146,11 @@ func (a *App) Prepare(ctx context.Context, req CastRequest) (*Preparation, error
 		p.Info = info
 	}
 
-	p.Codec = codecPlan(p.Info, defaultProfile, req.ForceTranscode)
+	p.Codec = codecPlan(p.Info, prof, req.ForceTranscode)
 
 	dec, derr := subs.Decide(subs.Request{
 		Info:        p.Info,
-		Profile:     defaultProfile,
+		Profile:     prof,
 		SidecarPath: p.Sidecar,
 		NoSubs:      req.Subtitle.NoSubs,
 		ForceBurn:   req.Subtitle.Burn,
@@ -130,6 +164,15 @@ func (a *App) Prepare(ctx context.Context, req CastRequest) (*Preparation, error
 		p.Strategy = dec
 	}
 	return p, nil
+}
+
+// DescribeProfile renders the profile line `--info` prints, or "" when the
+// profile has no name to show.
+func (p *Preparation) DescribeProfile() string {
+	if p.ProfileName == "" {
+		return ""
+	}
+	return fmt.Sprintf("  -> profile: %s\n", p.ProfileName)
 }
 
 // resolveSubtitle returns the subtitle path to use: the explicit one if given,

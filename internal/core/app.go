@@ -10,29 +10,26 @@ import (
 	"strings"
 	"time"
 
-	"github.com/juliocesar/movcaster/internal/discovery"
-	"github.com/juliocesar/movcaster/internal/renderer"
+	"github.com/juliocesar/movcaster/internal/engine"
 )
 
 // App is the orchestration entry point. It holds cross-cast dependencies and is
 // cheap to construct; no I/O happens until a method is called.
 type App struct {
-	finder      DeviceFinder
-	newServer   func(deviceHost string) (MediaServer, error)
-	newRenderer func(discovery.Device) RendererControl
-	store       Store
-	resume      resumeStore
-	onEvent     func(Event)
+	finder    DeviceFinder
+	newServer func(deviceHost string) (MediaServer, error)
+	store     Store
+	resume    resumeStore
+	onEvent   func(Event)
 }
 
 // Options configures an App. All fields are optional; zero values wire the
-// production implementations. Tests override finder/newServer/newRenderer/store
-// with fakes, and onEvent to capture progress.
+// production implementations. Tests override finder/newServer/store with fakes,
+// and onEvent to capture progress.
 type Options struct {
-	Finder      DeviceFinder
-	NewServer   func(deviceHost string) (MediaServer, error)
-	NewRenderer func(discovery.Device) RendererControl
-	Store       Store
+	Finder    DeviceFinder
+	NewServer func(deviceHost string) (MediaServer, error)
+	Store     Store
 	// Resume persists playback positions. The CLI supplies *resume.Store; when
 	// left nil, the resume feature is disabled (e.g. in tests).
 	Resume  resumeStore
@@ -59,21 +56,17 @@ type Event struct {
 // New builds an App, defaulting any unset dependency to its production impl.
 func New(opts Options) *App {
 	a := &App{
-		finder:      opts.Finder,
-		newServer:   opts.NewServer,
-		newRenderer: opts.NewRenderer,
-		store:       opts.Store,
-		resume:      opts.Resume,
-		onEvent:     opts.OnEvent,
+		finder:    opts.Finder,
+		newServer: opts.NewServer,
+		store:     opts.Store,
+		resume:    opts.Resume,
+		onEvent:   opts.OnEvent,
 	}
 	if a.finder == nil {
 		a.finder = realFinder{}
 	}
 	if a.newServer == nil {
 		a.newServer = func(host string) (MediaServer, error) { return realServer(host) }
-	}
-	if a.newRenderer == nil {
-		a.newRenderer = func(d discovery.Device) RendererControl { return renderer.New(d) }
 	}
 	if a.store == nil {
 		a.store = configStore{}
@@ -155,9 +148,16 @@ func brewFormulaFromError(output string) string {
 	return rest
 }
 
-// ListDevices discovers DLNA renderers on the LAN.
-func (a *App) ListDevices(ctx context.Context) ([]discovery.Device, error) {
-	return a.finder.Discover(ctx)
+// ListDevices discovers renderers on the LAN across every registered engine
+// (or just one, when only is non-empty).
+func (a *App) ListDevices(ctx context.Context, only string) ([]engine.Device, error) {
+	return a.finder.Discover(ctx, only)
+}
+
+// ResolveDevice resolves an explicit target to a device (used by --info -t and
+// --probe-device, which need a real device's profile without starting a cast).
+func (a *App) ResolveDevice(ctx context.Context, target, only string) (engine.Device, error) {
+	return a.selectDevice(ctx, target, only)
 }
 
 // Discovery timeouts. The first pass is short (TVs that are awake answer the
@@ -171,16 +171,16 @@ const (
 // selectDevice resolves the target to a device. Empty target picks the saved or
 // sole device, and when none answer the quick pass it falls back to a longer
 // search (with user feedback) before giving up. A target matches by host IP
-// (robust to the TV's dynamic control port), falling back to a direct
-// description-URL load.
-func (a *App) selectDevice(ctx context.Context, target string) (*discovery.Device, error) {
+// (robust to a TV's dynamic control port), falling back to the engines' own
+// Resolve paths (unicast probe, direct connection, description URL).
+func (a *App) selectDevice(ctx context.Context, target, only string) (engine.Device, error) {
 	if target != "" {
-		return a.selectTarget(ctx, target)
+		return a.selectTarget(ctx, target, only)
 	}
 
 	// Quick pass: prefer the saved or sole device if anything answers promptly.
 	qctx, cancel := context.WithTimeout(ctx, quickDiscover)
-	devices, derr := a.finder.Discover(qctx)
+	devices, derr := a.finder.Discover(qctx, only)
 	cancel()
 	if derr == nil {
 		if d := a.pickDevice(devices); d != nil {
@@ -193,34 +193,41 @@ func (a *App) selectDevice(ctx context.Context, target string) (*discovery.Devic
 
 	// Nothing yet: search harder before giving up, telling the user why we wait.
 	a.emit(Info, "Looking for a TV...")
-	return a.waitForDevice(ctx, deepDiscover)
+	return a.waitForDevice(ctx, deepDiscover, only)
 }
 
 // pickDevice returns the device to use from a discovery result: the saved
 // device if present, else the sole device. Returns nil when the choice is
-// ambiguous (multiple, none saved) or empty.
-func (a *App) pickDevice(devices []discovery.Device) *discovery.Device {
-	if saved := a.store.Load().LastDeviceHost; saved != "" {
-		for i := range devices {
-			if devices[i].Location != nil && hostOf(devices[i].Location.Host) == saved {
-				return &devices[i]
+// ambiguous (multiple, none saved) or empty. A saved engine narrows the match
+// (two engines can expose the same host); an old config without one matches by
+// host alone, exactly like the single-engine days.
+func (a *App) pickDevice(devices []engine.Device) engine.Device {
+	cfg := a.store.Load()
+	if saved := cfg.LastDeviceHost; saved != "" {
+		for _, d := range devices {
+			if d.Host() != saved {
+				continue
 			}
+			if cfg.LastDeviceEngine != "" && d.Engine() != cfg.LastDeviceEngine {
+				continue
+			}
+			return d
 		}
 	}
 	if len(devices) == 1 {
-		return &devices[0]
+		return devices[0]
 	}
 	return nil
 }
 
 // waitForDevice repeatedly discovers until a usable renderer appears or budget
-// elapses. Each pass blocks on its own SSDP search; we retry until the deadline.
-func (a *App) waitForDevice(ctx context.Context, budget time.Duration) (*discovery.Device, error) {
+// elapses. Each pass blocks on its own search; we retry until the deadline.
+func (a *App) waitForDevice(ctx context.Context, budget time.Duration, only string) (engine.Device, error) {
 	dctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	savedHost := a.store.Load().LastDeviceHost
+	cfg := a.store.Load()
 	for {
-		devices, err := a.finder.Discover(dctx)
+		devices, err := a.finder.Discover(dctx, only)
 		if err == nil {
 			if d := a.pickDevice(devices); d != nil {
 				return d, nil
@@ -229,10 +236,14 @@ func (a *App) waitForDevice(ctx context.Context, budget time.Duration) (*discove
 				return nil, fmt.Errorf("%d renderers found; pick one with -t (run -l to list)", len(devices))
 			}
 		}
-		// A saved TV that's slow on multicast (common right after wake) often
-		// still answers a unicast probe, which also survives dropped multicast.
-		if savedHost != "" {
-			if d, err := a.finder.FindByHost(dctx, savedHost); err == nil {
+		// A saved TV that's slow to answer broadcasts (common right after wake)
+		// often still answers a direct probe, which also survives dropped multicast.
+		if cfg.LastDeviceHost != "" {
+			resolveOnly := only
+			if resolveOnly == "" {
+				resolveOnly = cfg.LastDeviceEngine
+			}
+			if d, err := a.finder.Resolve(dctx, cfg.LastDeviceHost, resolveOnly); err == nil {
 				return d, nil
 			}
 		}
@@ -243,39 +254,31 @@ func (a *App) waitForDevice(ctx context.Context, budget time.Duration) (*discove
 }
 
 // selectTarget resolves an explicit target: match a discovered device by host
-// IP, else load the device directly from its description URL.
-func (a *App) selectTarget(ctx context.Context, target string) (*discovery.Device, error) {
-	qctx, cancel := context.WithTimeout(ctx, quickDiscover)
-	devices, _ := a.finder.Discover(qctx)
-	cancel()
+// IP first (cheap and port-agnostic), else hand the target to the engines' own
+// Resolve paths.
+func (a *App) selectTarget(ctx context.Context, target, only string) (engine.Device, error) {
+	prefix, bare := engine.SplitTarget(target)
+	if prefix != "" {
+		only = prefix
+	}
+	wantHost := hostOf(bare)
 
-	wantHost := hostOf(target)
-	for i := range devices {
-		if devices[i].Location != nil && hostOf(devices[i].Location.Host) == wantHost {
-			return &devices[i], nil
-		}
-	}
-	// An explicit description URL (host + port) loads directly, no SSDP.
-	if u, err := url.Parse(ensureScheme(target)); err == nil && u.Host != "" && u.Port() != "" {
-		uctx, ucancel := context.WithTimeout(ctx, quickDiscover)
-		d, err := a.finder.FindByURL(uctx, u)
-		ucancel()
-		if err == nil {
+	qctx, cancel := context.WithTimeout(ctx, quickDiscover)
+	devices, _ := a.finder.Discover(qctx, only)
+	cancel()
+	for _, d := range devices {
+		if wantHost != "" && d.Host() == wantHost {
 			return d, nil
 		}
 	}
-	// SSDP-free fallback: unicast probe straight to the host. Handles a bare IP
-	// (the control port is dynamic, so we can't guess a URL) and a multicast
-	// search that came up empty.
-	if wantHost != "" {
-		hctx, hcancel := context.WithTimeout(ctx, deepDiscover)
-		d, err := a.finder.FindByHost(hctx, wantHost)
-		hcancel()
-		if err == nil {
-			return d, nil
-		}
+
+	rctx, rcancel := context.WithTimeout(ctx, deepDiscover)
+	defer rcancel()
+	d, err := a.finder.Resolve(rctx, target, only)
+	if err != nil {
+		return nil, fmt.Errorf("target %q not found among %d discovered renderer(s): %w", target, len(devices), err)
 	}
-	return nil, fmt.Errorf("target %q not found among %d discovered renderer(s)", target, len(devices))
+	return d, nil
 }
 
 func ensureScheme(s string) string {
@@ -341,4 +344,16 @@ func clock(d time.Duration) string {
 		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 	}
 	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+// sleepCtx sleeps d, returning false if ctx is cancelled first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }

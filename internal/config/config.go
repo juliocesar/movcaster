@@ -11,6 +11,10 @@ import (
 // Config is the persisted state.
 type Config struct {
 	LastDeviceHost string `json:"last_device_host"` // bare IP, port-independent
+	// LastDeviceEngine is the engine that owned the last device. Empty (an old
+	// config, or pre-engine state) means "try every engine against that host",
+	// which is exactly what the single-engine behavior was.
+	LastDeviceEngine string `json:"last_device_engine,omitempty"`
 }
 
 func path() (string, error) {

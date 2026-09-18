@@ -13,7 +13,6 @@ import (
 	"github.com/juliocesar/movcaster/internal/config"
 	"github.com/juliocesar/movcaster/internal/engine"
 	"github.com/juliocesar/movcaster/internal/probe"
-	"github.com/juliocesar/movcaster/internal/renderer"
 	"github.com/juliocesar/movcaster/internal/subs"
 	"github.com/juliocesar/movcaster/internal/transcode"
 )
@@ -23,8 +22,8 @@ import (
 // direct-play (native byte-range seek) and transcode (seek-restart: relaunch
 // ffmpeg at a new -ss offset), reporting a sane position/duration in both modes.
 type Cast struct {
-	r   RendererControl
-	srv MediaServer
+	sess engine.Session
+	srv  MediaServer
 
 	knownDuration time.Duration
 
@@ -34,8 +33,9 @@ type Cast struct {
 	// resoft re-prepares soft subs for a transcode segment starting at ss (nil when
 	// the delivery has none to rebase). Seek must call it: a seek-restart rebases
 	// the stream to 0, so the cue times have to be rebased to match.
-	resoft softSubFn
-	media  renderer.Media
+	resoft  softSubFn
+	media   engine.Media
+	profile engine.Profile // the device's capabilities (drives StartAt vs post-Play seek)
 
 	// UI metadata.
 	title   string
@@ -45,6 +45,12 @@ type Cast struct {
 
 	mu       sync.Mutex
 	ssOffset time.Duration // absolute offset the current transcode segment starts at
+
+	// Cached device status. The TUI polls Position and PlayerState back to back
+	// every second; one engine Status per beat is enough (on DLNA each Status is
+	// two SOAP calls, so the cache keeps the per-second SOAP volume unchanged).
+	lastStatus   engine.State
+	lastStatusAt time.Time
 
 	seekMu sync.Mutex // serializes seek-restarts (and live subtitle switches)
 
@@ -101,40 +107,75 @@ func (c *Cast) SubInfo() string {
 func (c *Cast) HasVolume() bool { return c.hasVol }
 
 // Play/Pause are no-ops while the initial start handshake is still running: the
-// stream is already buffering (webOS auto-plays on SetAVTransportURI) and issuing
-// competing control there is exactly what makes the TV choke mid-transition.
+// stream is already buffering (most devices auto-play on Load) and issuing
+// competing control there is exactly what makes a TV choke mid-transition.
 func (c *Cast) Play(ctx context.Context) error {
 	if c.starting.Load() {
 		return nil
 	}
-	return c.r.Play(ctx)
+	c.invalidateStatus()
+	return c.sess.Play(ctx)
 }
 func (c *Cast) Pause(ctx context.Context) error {
 	if c.starting.Load() {
 		return nil
 	}
-	return c.r.Pause(ctx)
+	c.invalidateStatus()
+	return c.sess.Pause(ctx)
 }
 
-// Stop cancels an in-flight start handshake (so its background SOAP stops racing
-// us) before stopping the TV. Called on quit and by Close.
+// Stop cancels an in-flight start handshake (so its background control traffic
+// stops racing us) before stopping the TV. Called on quit and by Close.
 func (c *Cast) Stop(ctx context.Context) error {
 	if c.startCancel != nil {
 		c.startCancel()
 	}
-	return c.r.Stop(ctx)
+	c.invalidateStatus()
+	return c.sess.Stop(ctx)
 }
-func (c *Cast) TransportState(ctx context.Context) (string, error) {
-	// While starting, report the buffering state without hitting the TV so the
-	// TUI shows "BUFFERING" instead of contending with the start handshake.
+
+// PlayerState reports the normalized transport state. While starting it
+// answers StateBuffering without hitting the TV, so the TUI's polling can't
+// contend with the in-flight start handshake.
+func (c *Cast) PlayerState(ctx context.Context) (engine.PlayerState, error) {
 	if c.starting.Load() {
-		return "TRANSITIONING", nil
+		return engine.StateBuffering, nil
 	}
-	return c.r.TransportState(ctx)
+	st, err := c.status(ctx)
+	return st.Player, err
 }
-func (c *Cast) Volume(ctx context.Context) (int, error)    { return c.r.Volume(ctx) }
-func (c *Cast) SetVolume(ctx context.Context, v int) error { return c.r.SetVolume(ctx, v) }
-func (c *Cast) Mute(ctx context.Context, on bool) error    { return c.r.Mute(ctx, on) }
+
+func (c *Cast) Volume(ctx context.Context) (int, error)    { return c.sess.Volume(ctx) }
+func (c *Cast) SetVolume(ctx context.Context, v int) error { return c.sess.SetVolume(ctx, v) }
+func (c *Cast) Mute(ctx context.Context, on bool) error    { return c.sess.Mute(ctx, on) }
+
+// status serves the device status from a short-lived cache: the TUI reads
+// Position and PlayerState back to back each second and one snapshot covers both.
+func (c *Cast) status(ctx context.Context) (engine.State, error) {
+	c.mu.Lock()
+	if time.Since(c.lastStatusAt) < 500*time.Millisecond {
+		st := c.lastStatus
+		c.mu.Unlock()
+		return st, nil
+	}
+	c.mu.Unlock()
+	st, err := c.sess.Status(ctx)
+	if err != nil {
+		return engine.State{}, err
+	}
+	c.mu.Lock()
+	c.lastStatus, c.lastStatusAt = st, time.Now()
+	c.mu.Unlock()
+	return st, nil
+}
+
+// invalidateStatus drops the cached snapshot after a control action so the next
+// poll reflects the new state instead of a stale one.
+func (c *Cast) invalidateStatus() {
+	c.mu.Lock()
+	c.lastStatusAt = time.Time{}
+	c.mu.Unlock()
+}
 
 // Position reports absolute position and total duration. In transcode mode the
 // TV's reported position is segment-relative, so we add the segment offset and
@@ -145,7 +186,11 @@ func (c *Cast) Position(ctx context.Context) (pos, dur time.Duration, err error)
 	if c.starting.Load() {
 		return 0, c.knownDuration, nil
 	}
-	pos, dur, err = c.r.Position(ctx)
+	st, err := c.status(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	pos, dur = st.Pos, st.Dur
 	c.mu.Lock()
 	build, off := c.buildArgs, c.ssOffset
 	c.mu.Unlock()
@@ -179,16 +224,16 @@ func (c *Cast) Status(ctx context.Context) Status {
 		HasVolume: c.hasVol,
 	}
 	s.Pos, s.Dur, _ = c.Position(ctx)
-	s.State, _ = c.r.TransportState(ctx)
+	s.State, _ = c.PlayerState(ctx)
 	if c.hasVol {
-		s.Volume, _ = c.r.Volume(ctx)
+		s.Volume, _ = c.sess.Volume(ctx)
 	}
 	return s
 }
 
 // Status is a snapshot of a live cast.
 type Status struct {
-	State     string
+	State     engine.PlayerState
 	Pos, Dur  time.Duration
 	Volume    int
 	HasVolume bool
@@ -209,7 +254,8 @@ func (c *Cast) Seek(ctx context.Context, pos time.Duration) error {
 	}
 	build := c.currentBuild()
 	if build == nil {
-		return c.r.Seek(ctx, pos)
+		c.invalidateStatus()
+		return c.sess.Seek(ctx, pos)
 	}
 	if pos < 0 {
 		pos = 0
@@ -224,17 +270,8 @@ func (c *Cast) Seek(ctx context.Context, pos time.Duration) error {
 	// us to direct-play) between the early check and acquiring the lock.
 	build = c.currentBuild()
 	if build == nil {
-		return c.r.Seek(ctx, pos)
-	}
-
-	// Stop the current stream (best-effort, short timeout) and let the TV settle
-	// before we hand it a new URI; swapping while it's still tearing down the old
-	// stream is what makes SetAVTransportURI hang.
-	stopCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	_ = c.r.Stop(stopCtx)
-	cancel()
-	if !sleepCtx(ctx, 500*time.Millisecond) {
-		return ctx.Err()
+		c.invalidateStatus()
+		return c.sess.Seek(ctx, pos)
 	}
 
 	c.srv.SetTranscode(build(pos))
@@ -252,17 +289,17 @@ func (c *Cast) Seek(ctx context.Context, pos time.Duration) error {
 		rcancel()
 	}
 
-	if err := retrySOAP(ctx, 3, 9*time.Second, func(ic context.Context) error {
-		return c.r.SetMedia(ic, c.media)
-	}); err != nil {
+	// Re-point the device at the fresh stream. The engine owns the flaky-TV
+	// handling: Load stops the old stream, waits the transport out, and retries;
+	// Play waits and retries the same way.
+	if err := c.sess.Load(ctx, c.media); err != nil {
 		return err
 	}
-	if err := retrySOAP(ctx, 3, 7*time.Second, func(ic context.Context) error {
-		return c.r.Play(ic)
-	}); err != nil {
+	if err := c.sess.Play(ctx); err != nil {
 		return err
 	}
 
+	c.invalidateStatus()
 	c.mu.Lock()
 	c.ssOffset = pos
 	c.mu.Unlock()
@@ -288,6 +325,9 @@ func (c *Cast) Close(ctx context.Context) error {
 		c.persistResume()
 		if c.releaseAwake != nil {
 			c.releaseAwake()
+		}
+		if c.sess != nil {
+			_ = c.sess.Close()
 		}
 		err = c.srv.Shutdown(ctx)
 		if c.tmpDir != "" {
@@ -330,16 +370,17 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 	}
 
 	// selectDevice owns its own discovery timeouts (quick pass + deep fallback).
-	dev, err := a.selectDevice(ctx, req.Target)
+	dev, err := a.selectDevice(ctx, req.Target, req.Engine)
 	if err != nil {
 		return nil, nil, err
 	}
-	a.emit(Info, "Casting to %s [%s]", dev.FriendlyName, dev.Location.Host)
+	a.emit(Info, "Casting to %s [%s]", dev.Name(), dev.Addr())
 
 	// Remember this device so a future bare `movcaster <file>` finds it again.
-	_ = a.store.Save(config.Config{LastDeviceHost: hostOf(dev.Location.Host)})
+	_ = a.store.Save(config.Config{LastDeviceHost: dev.Host(), LastDeviceEngine: dev.Engine()})
 
-	prep, err := a.Prepare(ctx, req)
+	prof := dev.Profile()
+	prep, err := a.PrepareWithProfile(ctx, req, prof, dev.Engine())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -355,23 +396,30 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 	}
 	abs := prep.AbsPath
 
-	srv, err := a.newServer(dev.Location.Host)
+	srv, err := a.newServer(dev.Host())
 	if err != nil {
 		return nil, nil, err
 	}
 	srv.Start()
-	rend := a.newRenderer(*dev)
 
-	tmpDir, err := os.MkdirTemp("", "movcaster-")
+	sess, err := dev.Open(ctx)
 	if err != nil {
 		_ = srv.Shutdown(context.Background())
 		return nil, nil, err
 	}
 
-	media := renderer.Media{Title: filepath.Base(abs)}
-	// Advertise the real duration in DIDL-Lite. Direct-play files declare it in
-	// their container anyway, but a live transcode streams an empty-moov fragmented
-	// MP4 with no total duration, so the TV's seek bar races without this hint.
+	tmpDir, err := os.MkdirTemp("", "movcaster-")
+	if err != nil {
+		_ = sess.Close()
+		_ = srv.Shutdown(context.Background())
+		return nil, nil, err
+	}
+
+	media := engine.Media{Title: filepath.Base(abs)}
+	// Advertise the real duration. Direct-play files declare it in their
+	// container anyway, but a live transcode streams an empty-moov fragmented
+	// MP4 with no total duration, so the TV's seek bar races without this hint
+	// (DIDL res@duration on DLNA, the LOAD duration on Cast).
 	if prep.Info != nil {
 		media.Duration = prep.Info.Duration
 	}
@@ -394,31 +442,45 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 	// not the raw --sub flag. It is silent, so Start reports the outcome itself.
 	subOpts := req.Subtitle
 	subOpts.Sidecar = prep.Sidecar
-	label, build, resoft, err := a.buildDelivery(srv, &media, abs, tmpDir, prep.Info, subOpts, req.ForceTranscode, startOffset)
+	label, build, resoft, err := a.buildDelivery(srv, &media, abs, tmpDir, prep.Info, subOpts, req.ForceTranscode, startOffset, prof)
 	if err != nil {
+		_ = sess.Close()
 		_ = srv.Shutdown(context.Background())
 		_ = os.RemoveAll(tmpDir)
 		return nil, nil, err
 	}
-	if label == "transcode" {
+	switch label {
+	case "transcode":
 		a.emit(Info, "Transcoding for codec compatibility...")
-	} else if label != "" {
+	case "remux":
+		a.emit(Info, "Remuxing for container compatibility...")
+	case "":
+	default:
 		a.emit(Info, "Subtitles: %s", label)
 	}
 	if startOffset > 0 {
 		a.emit(Info, "Resuming at %s", clock(startOffset))
 	}
 
-	// Hand the URI to the TV synchronously so we can still fail Start cleanly if
-	// the device rejects it. This returns as soon as the URI is accepted, at which
-	// point webOS starts buffering/auto-playing — the slow bit (waiting out the
-	// buffering TRANSITIONING state, then Play, then a direct-play resume seek) is
-	// run off the critical path below so the TUI renders immediately instead of
-	// freezing for the seconds a large direct-play file takes to buffer.
+	// A resume on a direct-play file: engines that honor a load-time offset (Cast)
+	// start there in one shot, which replaces the whole post-Play retry-a-seek
+	// dance. Engines that don't (DLNA) get the post-Play seek below. A transcode
+	// bakes the offset into the stream itself, so StartAt stays 0 there.
+	if build == nil && startOffset > 0 && prof.HonorsStartAt {
+		media.StartAt = startOffset
+	}
+
+	// Hand the media to the device synchronously so we can still fail Start
+	// cleanly if it is rejected. Load returns as soon as the device accepts it, at
+	// which point most devices start buffering/auto-playing — the slow bit
+	// (waiting out buffering, Play, then a possible resume seek) runs off the
+	// critical path below so the TUI renders immediately instead of freezing for
+	// the seconds a large direct-play file takes to buffer.
 	setCtx, setCancel := context.WithTimeout(ctx, 15*time.Second)
-	err = setTransportURI(setCtx, rend, media)
+	err = sess.Load(setCtx, media)
 	setCancel()
 	if err != nil {
+		_ = sess.Close()
 		_ = srv.Shutdown(context.Background())
 		_ = os.RemoveAll(tmpDir)
 		return nil, nil, err
@@ -426,16 +488,17 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 
 	choices := buildSubChoices(prep.Info, prep.Sidecar)
 	c := &Cast{
-		r:             rend,
+		sess:          sess,
 		srv:           srv,
 		media:         media,
+		profile:       prof,
 		knownDuration: knownDur,
 		buildArgs:     build,
 		resoft:        resoft,
 		title:         filepath.Base(abs),
-		device:        dev.FriendlyName,
+		device:        dev.Name(),
 		subInfo:       label,
-		hasVol:        rend.HasVolume(),
+		hasVol:        sess.HasVolume(),
 		tmpDir:        tmpDir,
 		resume:        a.resume,
 		resumePath:    abs,
@@ -454,12 +517,12 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		c.ssOffset = startOffset // transcode stream starts at this absolute offset
 	}
 
-	// Finish playback startup in the background: wait out the buffering
-	// TRANSITIONING state, Play, and (for direct-play resume) seek to the saved
-	// offset. While this runs, the Cast's AVTransport read/control methods
-	// short-circuit (see starting) so the TUI can render and poll without
-	// contending with these SOAP calls. Uses its own context (Start's ctx may be
-	// short-lived); Close cancels it.
+	// Finish playback startup in the background: Play (which the engine may block
+	// on while the device buffers), then, when the engine could not honor
+	// StartAt, the direct-play resume seek. While this runs, the Cast's
+	// read/control methods short-circuit (see starting) so the TUI can render and
+	// poll without contending with the handshake. Uses its own context (Start's
+	// ctx may be short-lived); Close cancels it.
 	c.starting.Store(true)
 	startCtx, startCancel := context.WithTimeout(context.Background(), 45*time.Second)
 	c.startCancel = startCancel
@@ -468,16 +531,14 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		defer close(c.startDone)
 		defer startCancel()
 		defer c.starting.Store(false)
-		if err := beginPlayback(startCtx, rend); err != nil {
+		if err := sess.Play(startCtx); err != nil {
 			return
 		}
-		// Direct-play resume: seek after Play (best-effort; the TV may need a moment
-		// to leave TRANSITIONING, so retry briefly). Transcode resume is already
-		// baked into the stream offset.
-		if build == nil && startOffset > 0 {
-			_ = retrySOAP(startCtx, 4, 3*time.Second, func(ic context.Context) error {
-				return rend.Seek(ic, startOffset)
-			})
+		// Direct-play resume without StartAt support: seek after Play
+		// (best-effort; the engine retries a mid-transition rejection itself).
+		// Transcode resume is already baked into the stream offset.
+		if build == nil && startOffset > 0 && !prof.HonorsStartAt {
+			_ = sess.Seek(startCtx, startOffset)
 		}
 	}()
 
@@ -486,7 +547,7 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 
 // applyTranscode points the server + media at the transcode stream starting at
 // the given offset (0 for a fresh cast; the resume position when resuming).
-func applyTranscode(srv MediaServer, media *renderer.Media, build func(time.Duration) []string, ss time.Duration) {
+func applyTranscode(srv MediaServer, media *engine.Media, build func(time.Duration) []string, ss time.Duration) {
 	srv.SetTranscode(build(ss))
 	media.URL = srv.MediaURL()
 	media.MIME = "video/mp4"
@@ -500,17 +561,18 @@ func applyTranscode(srv MediaServer, media *renderer.Media, build func(time.Dura
 // position otherwise). It performs no TV I/O and never emits, so it is safe to
 // call during a live switch without corrupting the TUI. It is idempotent across
 // mode flips: each call re-establishes the baseline before applying.
-func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir string,
+func (a *App) buildDelivery(srv MediaServer, media *engine.Media, abs, tmpDir string,
 	info *probe.MediaInfo, sub SubtitleOptions, forceTranscode bool, ss time.Duration,
+	prof engine.Profile,
 ) (label string, build func(time.Duration) []string, resoft softSubFn, err error) {
 
 	// Baseline: direct-play the original file, no subs.
 	srv.SetDirectPlay(abs, mimeForExt(abs))
 	media.URL, media.MIME, media.Seekable = srv.MediaURL(), mimeForExt(abs), true
-	media.SubURL, media.SubMIME, media.SubType = "", "", ""
+	media.Subtitle, media.StartAt = nil, 0
 
 	dec, derr := subs.Decide(subs.Request{
-		Info: info, Profile: defaultProfile, SidecarPath: sub.Sidecar,
+		Info: info, Profile: prof, SidecarPath: sub.Sidecar,
 		NoSubs: sub.NoSubs, ForceBurn: sub.Burn, ForceSoft: sub.Soft,
 		MuxSoftTry: sub.MuxSoft, TrackIndex: sub.TrackIndex,
 	})
@@ -522,7 +584,7 @@ func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir 
 	// prepared: a transcoded (or remuxed) stream is rebased to start at 0, so
 	// soft cue times must be rebased by the same ss to stay in step (direct-play
 	// keeps the file's own absolute timeline, so it stays at 0).
-	plan := codecPlan(info, defaultProfile, forceTranscode)
+	plan := codecPlan(info, prof, forceTranscode)
 	subOffset := time.Duration(0)
 	if plan.Kind != TranscodeNone {
 		subOffset = ss
@@ -536,7 +598,7 @@ func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir 
 	// Codec/container fallback: only when subs didn't already force a transcode.
 	if build == nil && plan.Kind != TranscodeNone {
 		tplan := plan.plan()
-		build = func(s time.Duration) []string { return transcode.Args(abs, s, defaultProfile, tplan) }
+		build = func(s time.Duration) []string { return transcode.Args(abs, s, prof, tplan) }
 		if label == "" {
 			if plan.Kind == TranscodeRemux {
 				label = "remux"
@@ -556,22 +618,22 @@ func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir 
 // rebasable soft subs (direct-play, burn-in, or none).
 //
 // The media is a parameter rather than captured because Start hands buildDelivery
-// a local renderer.Media that is then *copied* into the Cast: a captured pointer
-// would keep updating the dead local, leaving the live DIDL pointing at the
+// a local engine.Media that is then *copied* into the Cast: a captured pointer
+// would keep updating the dead local, leaving the live metadata pointing at the
 // previous segment's caption URL.
-type softSubFn func(ctx context.Context, ss time.Duration, media *renderer.Media) error
+type softSubFn func(ctx context.Context, ss time.Duration, media *engine.Media) error
 
 // serveSoft points the server + media at a soft-subtitle file and refreshes the
 // caption URL. The MIME/type follow the decision's format, not the extension.
-func serveSoft(srv MediaServer, media *renderer.Media, path string, format engine.SubFormat) {
+func serveSoft(srv MediaServer, media *engine.Media, path string, format engine.SubFormat) {
 	mime := format.MIME()
 	srv.SetSubtitle(path, mime)
-	media.SubURL, media.SubMIME, media.SubType = srv.SubURL(), mime, format.String()
+	media.Subtitle = &engine.Subtitle{URL: srv.SubURL(), Format: format, MIME: mime}
 }
 
 // clearSoft drops the caption reference (used when no cues remain after ss).
-func clearSoft(media *renderer.Media) {
-	media.SubURL, media.SubMIME, media.SubType = "", "", ""
+func clearSoft(media *engine.Media) {
+	media.Subtitle = nil
 }
 
 // applySubtitles executes the chosen subtitle strategy against the server +
@@ -580,14 +642,14 @@ func clearSoft(media *renderer.Media) {
 // helper serves both the initial cast and a live switch.
 // subOffset is the offset the served cue times must be rebased by (0 to keep the
 // file's absolute timeline); see softSubFn.
-func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, dec subs.Decision, ss, subOffset time.Duration) (label string, build func(time.Duration) []string, resoft softSubFn, err error) {
+func applySubtitles(srv MediaServer, media *engine.Media, abs, tmpDir string, dec subs.Decision, ss, subOffset time.Duration) (label string, build func(time.Duration) []string, resoft softSubFn, err error) {
 	switch dec.Kind {
 	case subs.None:
 		return "", nil, nil, nil
 
 	case subs.SoftSidecar:
 		sidecar, format := dec.SidecarPath, dec.Format
-		resoft = func(ctx context.Context, at time.Duration, m *renderer.Media) error {
+		resoft = func(ctx context.Context, at time.Duration, m *engine.Media) error {
 			shifted, err := subs.ShiftText(ctx, sidecar, at, tmpDir, format)
 			if subs.NoCuesAfterOffset(err) {
 				clearSoft(m)
@@ -608,7 +670,7 @@ func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, 
 
 	case subs.SoftExtract:
 		idx, format := dec.Track.SubIndex, dec.Format
-		resoft = func(ctx context.Context, at time.Duration, m *renderer.Media) error {
+		resoft = func(ctx context.Context, at time.Duration, m *engine.Media) error {
 			extracted, err := subs.ExtractText(ctx, abs, idx, at, tmpDir, format)
 			if subs.NoCuesAfterOffset(err) {
 				clearSoft(m)
@@ -809,20 +871,32 @@ func (c *Cast) SetSubtitle(ctx context.Context, idx int) error {
 
 	choice := c.subChoices[idx]
 	label, build, resoft, err := c.app.buildDelivery(c.srv, &c.media, c.abs, c.tmpDir,
-		c.info, choice.opts, c.forceTranscode, pos) // ss=pos => transcode starts at pos in one shot
+		c.info, choice.opts, c.forceTranscode, pos, c.profile) // ss=pos => transcode starts at pos in one shot
 	if err != nil {
 		return err
 	}
 
-	// Re-point the TV at the fresh stream and resume (Stop -> settle -> SetURI -> Play).
-	if err := startPlayback(ctx, c.r, c.media); err != nil {
-		return err
-	}
-	// Direct-play resume: seek after Play (transcode resume is baked into ss above).
-	if build == nil && pos > 0 {
-		_ = retrySOAP(ctx, 4, 3*time.Second, func(ic context.Context) error { return c.r.Seek(ic, pos) })
+	// Direct-play resume on an engine with load-time offsets: bake the position
+	// into the Load instead of seeking afterward.
+	if build == nil && pos > 0 && c.profile.HonorsStartAt {
+		c.media.StartAt = pos
 	}
 
+	// Re-point the TV at the fresh stream and resume. The engine owns the settle
+	// waits and retries inside Load/Play.
+	if err := c.sess.Load(ctx, c.media); err != nil {
+		return err
+	}
+	if err := c.sess.Play(ctx); err != nil {
+		return err
+	}
+	// Direct-play resume without StartAt support: seek after Play (the engine
+	// retries a mid-transition rejection itself).
+	if build == nil && pos > 0 && !c.profile.HonorsStartAt {
+		_ = c.sess.Seek(ctx, pos)
+	}
+
+	c.invalidateStatus()
 	c.mu.Lock()
 	c.buildArgs = build
 	c.resoft = resoft
@@ -835,118 +909,4 @@ func (c *Cast) SetSubtitle(ctx context.Context, idx int) error {
 	c.activeSub = idx
 	c.mu.Unlock()
 	return nil
-}
-
-// startPlayback points the TV at media for a fresh cast: best-effort Stop, wait
-// for the TV to leave the transitioning state, SetAVTransportURI, wait again for
-// it to settle, then Play. webOS rejects both a new URI and a Play with 701
-// "Transition not available" while it reports "LG_TRANSITIONING", so we poll its
-// state at both points rather than sleeping a fixed interval (firing too early is
-// exactly what triggers the 701). The pre-URI wait covers a TV left mid-transition
-// by a previous cast; the pre-Play wait covers the TV buffering the freshly-set
-// URI — which lingers for a live transcode resumed deep into the file (its ffmpeg
-// needs seconds to -ss-seek and emit the first fragment). The retries cover
-// residual flakiness. Mirrors the seek-restart sequence in Seek.
-func startPlayback(ctx context.Context, r RendererControl, media renderer.Media) error {
-	if err := setTransportURI(ctx, r, media); err != nil {
-		return err
-	}
-	return beginPlayback(ctx, r)
-}
-
-// setTransportURI is the fast half of startPlayback: best-effort Stop, wait for
-// the TV to leave the transitioning state left by a previous cast, then
-// SetAVTransportURI. It returns as soon as the TV has accepted the URI — at which
-// point webOS begins fetching/auto-playing the stream — so the caller can bring
-// up the UI without waiting on the (slow) Play handshake in beginPlayback.
-func setTransportURI(ctx context.Context, r RendererControl, media renderer.Media) error {
-	stopCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	_ = r.Stop(stopCtx)
-	cancel()
-	waitTransportSettled(ctx, r, 6*time.Second)
-
-	if err := retrySOAP(ctx, 3, 9*time.Second, func(ic context.Context) error {
-		return r.SetMedia(ic, media)
-	}); err != nil {
-		return fmt.Errorf("SetAVTransportURI: %w", err)
-	}
-	return nil
-}
-
-// beginPlayback is the slow half of startPlayback: wait for the TV to finish
-// buffering the freshly-set URI (it rejects Play with 701 while TRANSITIONING),
-// then Play. For a large direct-play file or a deep-offset transcode this wait
-// runs into the seconds, which is why Start runs it off the critical path.
-func beginPlayback(ctx context.Context, r RendererControl) error {
-	// After accepting the URI the TV fetches the media URL and sits in
-	// TRANSITIONING while it buffers; it rejects Play with 701 until it leaves
-	// that state. A fresh/offset-0 stream settles almost immediately, but a live
-	// transcode resumed deep into the file (e.g. --resume burning bitmap subs
-	// from 40 min in) needs several seconds to -ss-seek and emit its first MP4
-	// fragment, so the TV lingers in TRANSITIONING long past the Play retries.
-	// Wait it out before Play (returns at once in the common fast case). Budget
-	// generously for a slow deep-offset transcode start; both waits fit the
-	// caller's 45s setCtx.
-	waitTransportSettled(ctx, r, 20*time.Second)
-
-	if err := retrySOAP(ctx, 3, 7*time.Second, func(ic context.Context) error {
-		return r.Play(ic)
-	}); err != nil {
-		return fmt.Errorf("Play: %w", err)
-	}
-	return nil
-}
-
-// waitTransportSettled blocks until the renderer reports a non-transitioning
-// transport state (or the budget/ctx elapses). webOS reports "LG_TRANSITIONING"
-// for a beat or two after a Stop, and accepts SetAVTransportURI only once it has
-// left that state. Best-effort: a read error or timeout just returns, letting the
-// retrying caller proceed.
-func waitTransportSettled(ctx context.Context, r RendererControl, budget time.Duration) {
-	wctx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	for {
-		sctx, scancel := context.WithTimeout(wctx, 2*time.Second)
-		state, err := r.TransportState(sctx)
-		scancel()
-		if err == nil && !strings.Contains(state, "TRANSITIONING") {
-			return
-		}
-		if !sleepCtx(wctx, 300*time.Millisecond) {
-			return
-		}
-	}
-}
-
-// retrySOAP runs fn up to attempts times, each with its own per-call timeout,
-// backing off briefly between tries. It stops early if the parent ctx is done.
-func retrySOAP(parent context.Context, attempts int, perCall time.Duration, fn func(context.Context) error) error {
-	var err error
-	for i := 0; i < attempts; i++ {
-		if parent.Err() != nil {
-			return parent.Err()
-		}
-		c, cancel := context.WithTimeout(parent, perCall)
-		err = fn(c)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		if !sleepCtx(parent, 400*time.Millisecond) {
-			return parent.Err()
-		}
-	}
-	return err
-}
-
-// sleepCtx sleeps d, returning false if ctx is cancelled first.
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
-	}
 }

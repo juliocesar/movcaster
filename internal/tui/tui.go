@@ -1,6 +1,7 @@
-// Package tui is a thin bubbletea view over a Controller (a cast.Session). All
+// Package tui is a thin bubbletea view over a Controller (a core.Cast). All
 // control actions route through the Controller; the model only renders state and
-// translates keystrokes into Controller calls.
+// translates keystrokes into Controller calls. State is the engine-neutral
+// PlayerState: the TUI never string-matches a protocol vocabulary.
 package tui
 
 import (
@@ -12,7 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/juliocesar/movcaster/internal/renderer"
+	"github.com/juliocesar/movcaster/internal/engine"
 )
 
 const seekStep = 10 * time.Second
@@ -33,7 +34,7 @@ const (
 	OutcomeNext                 // user asked for the next episode (n)
 )
 
-// Controller is the playback behavior the TUI drives. cast.Session implements it
+// Controller is the playback behavior the TUI drives. *core.Cast implements it
 // for both direct-play (native seek) and transcode (seek-restart).
 type Controller interface {
 	Play(context.Context) error
@@ -41,20 +42,17 @@ type Controller interface {
 	Stop(context.Context) error
 	Seek(context.Context, time.Duration) error
 	Position(context.Context) (pos, dur time.Duration, err error)
-	TransportState(context.Context) (string, error)
+	PlayerState(context.Context) (engine.PlayerState, error)
 	HasVolume() bool
 	Volume(context.Context) (int, error)
 	SetVolume(context.Context, int) error
 	Mute(context.Context, bool) error
 }
 
-// Ensure *renderer.Renderer satisfies Controller.
-var _ Controller = (*renderer.Renderer)(nil)
-
 // SubtitleController is the optional capability of live subtitle switching,
-// implemented by *core.Cast. *renderer.Renderer does not implement it, so the
-// picker simply never opens for controllers that lack subtitle support. It is
-// kept separate from Controller so the renderer assertion above still holds.
+// implemented by *core.Cast. The picker simply never opens for controllers that
+// lack it. It is kept separate from Controller so simpler controllers (tests)
+// need not implement it.
 type SubtitleController interface {
 	SubtitleChoices() []string
 	ActiveSubtitle() int
@@ -67,7 +65,7 @@ const seekDebounce = time.Second
 type tickMsg time.Time
 type posMsg struct {
 	pos, dur time.Duration
-	state    string
+	state    engine.PlayerState
 }
 type volMsg int
 type errMsg struct{ err error }
@@ -100,7 +98,7 @@ type model struct {
 	subInfo string
 
 	pos, dur   time.Duration
-	state      string
+	state      engine.PlayerState
 	volume     int
 	hasVol     bool
 	muted      bool
@@ -163,7 +161,6 @@ func Run(ctrl Controller, opts Options) (Outcome, error) {
 		device:  opts.Device,
 		subInfo: opts.SubInfo,
 		hasVol:  opts.HasVolume,
-		state:   "...",
 		width:   60,
 		height:  24,
 		prog:    progress.New(progress.WithDefaultGradient(), progress.WithWidth(50)),
@@ -198,7 +195,6 @@ func Start(title string, startFn func(ctx context.Context, emit func(string)) (C
 	m := model{
 		connecting: true,
 		title:      title,
-		state:      "...",
 		width:      60,
 		height:     24, // replaced by the first WindowSizeMsg; a sane picker size until then
 		prog:       progress.New(progress.WithDefaultGradient(), progress.WithWidth(50)),
@@ -269,7 +265,7 @@ func (m model) pollCmd() tea.Cmd {
 		if err != nil {
 			return errMsg{err}
 		}
-		state, _ := m.ctrl.TransportState(ctx)
+		state, _ := m.ctrl.PlayerState(ctx)
 		return posMsg{pos: pos, dur: dur, state: state}
 	}
 }
@@ -364,15 +360,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.seeking { // don't fight the user's pending target
 			m.pos = msg.pos
 		}
-		if msg.state == "PLAYING" {
+		if msg.state == engine.StatePlaying {
 			m.everPlayed = true
 		}
 		if msg.pos > m.maxProgress {
 			m.maxProgress = msg.pos
 		}
-		// Natural end: the TV stops after we've seen it play, with the furthest
-		// observed position within endGuard of the duration. The seeking gate on
-		// tickMsg means a mid-seek-restart STOPPED is never sampled here.
+		// Explicit end: an engine that can tell (Cast's idleReason FINISHED)
+		// reports StateFinished, which needs no inference at all.
+		if msg.state == engine.StateFinished && !m.seeking {
+			m.outcome = OutcomeEnded
+			m.quitting = true
+			return m, tea.Quit
+		}
+		// Inferred end (DLNA has no finished signal): the TV stops after we've
+		// seen it play, with the furthest observed position within endGuard of
+		// the duration. The seeking gate on tickMsg means a mid-seek-restart
+		// STOPPED is never sampled here.
 		if m.everPlayed && !m.seeking && isStopped(msg.state) &&
 			m.dur > 0 && m.maxProgress >= m.dur-endGuard {
 			m.outcome = OutcomeEnded
@@ -382,7 +386,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Fetch volume once the TV has settled out of the (buffering) transitioning
 		// state; retried each poll until it succeeds. RenderingControl reads issued
 		// while transitioning fail with 606, so we defer rather than fetch at Init.
-		if m.hasVol && !m.volFetched && msg.state != "" && msg.state != "TRANSITIONING" {
+		if m.hasVol && !m.volFetched && msg.state != engine.StateUnknown && msg.state != engine.StateBuffering {
 			return m, m.fetchVolCmd()
 		}
 		return m, nil
@@ -488,7 +492,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Sequence(stop, tea.Quit)
 
 	case " ", "p":
-		if m.state == "PLAYING" {
+		if m.state == engine.StatePlaying {
 			return m, actionCmd(m.ctrl.Pause)
 		}
 		return m, actionCmd(m.ctrl.Play)
@@ -768,26 +772,26 @@ func (m model) renderSubMenu() string {
 	return b.String()
 }
 
-// isStopped reports whether a transport state means playback has stopped (the TV
-// uses STOPPED; some report NO_MEDIA_PRESENT once the stream is fully drained).
-func isStopped(state string) bool {
-	return state == "STOPPED" || state == "NO_MEDIA_PRESENT"
+// isStopped reports whether a state means playback has stopped (engines map a
+// drained NO_MEDIA_PRESENT to StateIdle, so both count for end-of-media inference).
+func isStopped(state engine.PlayerState) bool {
+	return state == engine.StateStopped || state == engine.StateIdle
 }
 
-func prettyState(s string) string {
+func prettyState(s engine.PlayerState) string {
 	switch s {
-	case "PLAYING":
+	case engine.StatePlaying:
 		return "▶ PLAYING"
-	case "PAUSED_PLAYBACK":
+	case engine.StatePaused:
 		return "⏸ PAUSED"
-	case "STOPPED":
+	case engine.StateStopped, engine.StateFinished:
 		return "⏹ STOPPED"
-	case "TRANSITIONING":
+	case engine.StateBuffering:
 		return "… BUFFERING"
-	case "":
-		return "…"
+	case engine.StateIdle:
+		return "⏹ IDLE"
 	default:
-		return s
+		return "…"
 	}
 }
 

@@ -4,6 +4,10 @@ package engine
 // a new TV is rarely the protocol — it is this data. Engines ship a conservative
 // default; --probe-device refines it per device into a config override.
 type Profile struct {
+	// Name is a short human-readable label for messages ("webOS",
+	// "Default Media Receiver").
+	Name string
+
 	// Containers accepted for direct play, by normalized ffprobe format name
 	// ("mov,mp4,m4a,3gp,3g2,mj2" normalizes to "mp4"). Empty = accept anything.
 	Containers map[string]bool

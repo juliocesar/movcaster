@@ -2,8 +2,6 @@ package core
 
 import (
 	"context"
-	"errors"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,36 +9,60 @@ import (
 	"time"
 
 	"github.com/juliocesar/movcaster/internal/config"
-	"github.com/juliocesar/movcaster/internal/discovery"
 	"github.com/juliocesar/movcaster/internal/engine"
 	"github.com/juliocesar/movcaster/internal/probe"
-	"github.com/juliocesar/movcaster/internal/renderer"
 	"github.com/juliocesar/movcaster/internal/subs"
 )
 
 // --- fakes ---
 
-type fakeFinder struct {
-	devices []discovery.Device
-	err     error
-	byURL   *discovery.Device
-	byHost  *discovery.Device
+type fakeDevice struct {
+	name string
+	host string
+	addr string
+	eng  string
+	prof engine.Profile
+	sess *fakeSession
 }
 
-func (f fakeFinder) Discover(context.Context) ([]discovery.Device, error) {
+func (d *fakeDevice) Name() string            { return d.name }
+func (d *fakeDevice) Host() string            { return d.host }
+func (d *fakeDevice) Addr() string            { return d.addr }
+func (d *fakeDevice) Engine() string          { return d.eng }
+func (d *fakeDevice) Profile() engine.Profile { return d.prof }
+func (d *fakeDevice) Open(context.Context) (engine.Session, error) {
+	if d.sess == nil {
+		d.sess = &fakeSession{}
+	}
+	return d.sess, nil
+}
+
+func device(name, host string) *fakeDevice {
+	h, addr := host, host
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		h = host[:i]
+	}
+	return &fakeDevice{name: name, host: h, addr: addr, eng: "dlna", prof: defaultProfile}
+}
+
+type fakeFinder struct {
+	devices    []engine.Device
+	err        error
+	resolved   engine.Device
+	resolveErr error
+}
+
+func (f fakeFinder) Discover(context.Context, string) ([]engine.Device, error) {
 	return f.devices, f.err
 }
-func (f fakeFinder) FindByURL(context.Context, *url.URL) (*discovery.Device, error) {
-	if f.byURL == nil {
+func (f fakeFinder) Resolve(context.Context, string, string) (engine.Device, error) {
+	if f.resolved == nil {
+		if f.resolveErr != nil {
+			return nil, f.resolveErr
+		}
 		return nil, context.Canceled
 	}
-	return f.byURL, nil
-}
-func (f fakeFinder) FindByHost(context.Context, string) (*discovery.Device, error) {
-	if f.byHost == nil {
-		return nil, context.Canceled
-	}
-	return f.byHost, nil
+	return f.resolved, nil
 }
 
 type fakeStore struct {
@@ -54,82 +76,37 @@ func (s *fakeStore) Save(c config.Config) error {
 	return nil
 }
 
-type fakeRenderer struct {
+// fakeSession records the control calls a Cast issues. Engines own the settle
+// waits and retries now, so the fake is deliberately simple: Load and Play just
+// succeed, and the tests assert the call sequence.
+type fakeSession struct {
 	calls    []string
-	media    renderer.Media
+	media    engine.Media
 	seekedTo time.Duration
-	pos, dur time.Duration
-	state    string
+	st       engine.State
 	hasVol   bool
-
-	// setMediaErrs is consumed front-to-back, one entry per SetMedia call, to
-	// simulate a TV that rejects the URI until its transport state clears.
-	setMediaErrs []error
-
-	// stateSeq is consumed front-to-back by TransportState (falling back to
-	// `state`), to simulate a TV that lingers in TRANSITIONING after a Stop.
-	stateSeq   []string
-	stateCalls int
-
-	// transitioningAfterSet models a TV that, once it has the URI, sits in
-	// TRANSITIONING (buffering a slow deep-offset transcode) for this many
-	// TransportState polls before settling. While transitioning, Play is
-	// rejected — reproducing the 701 on the --resume path.
-	transitioningAfterSet int
-	setMediaCount         int
-	pollsAfterSet         int
+	closed   int
 }
 
-// transitioning reports whether the TV is still buffering a freshly-set URI.
-func (r *fakeRenderer) transitioning() bool {
-	return r.setMediaCount > 0 && r.pollsAfterSet < r.transitioningAfterSet
-}
-
-func (r *fakeRenderer) SetMedia(_ context.Context, m renderer.Media) error {
-	r.calls = append(r.calls, "SetMedia")
-	r.media = m
-	r.setMediaCount++
-	if len(r.setMediaErrs) > 0 {
-		err := r.setMediaErrs[0]
-		r.setMediaErrs = r.setMediaErrs[1:]
-		return err
-	}
+func (s *fakeSession) Load(_ context.Context, m engine.Media) error {
+	s.calls = append(s.calls, "Load")
+	s.media = m
 	return nil
 }
-func (r *fakeRenderer) Play(context.Context) error {
-	r.calls = append(r.calls, "Play")
-	if r.transitioning() {
-		return errors.New("701 Transition not available")
-	}
+func (s *fakeSession) Play(context.Context) error  { s.calls = append(s.calls, "Play"); return nil }
+func (s *fakeSession) Pause(context.Context) error { s.calls = append(s.calls, "Pause"); return nil }
+func (s *fakeSession) Stop(context.Context) error  { s.calls = append(s.calls, "Stop"); return nil }
+func (s *fakeSession) Seek(_ context.Context, p time.Duration) error {
+	s.calls = append(s.calls, "Seek")
+	s.seekedTo = p
 	return nil
 }
-func (r *fakeRenderer) Pause(context.Context) error { r.calls = append(r.calls, "Pause"); return nil }
-func (r *fakeRenderer) Stop(context.Context) error  { r.calls = append(r.calls, "Stop"); return nil }
-func (r *fakeRenderer) Seek(_ context.Context, p time.Duration) error {
-	r.calls = append(r.calls, "Seek")
-	r.seekedTo = p
-	return nil
-}
-func (r *fakeRenderer) Position(context.Context) (time.Duration, time.Duration, error) {
-	return r.pos, r.dur, nil
-}
-func (r *fakeRenderer) TransportState(context.Context) (string, error) {
-	r.stateCalls++
-	if r.transitioning() {
-		r.pollsAfterSet++
-		return "LG_TRANSITIONING", nil
-	}
-	if len(r.stateSeq) > 0 {
-		s := r.stateSeq[0]
-		r.stateSeq = r.stateSeq[1:]
-		return s, nil
-	}
-	return r.state, nil
-}
-func (r *fakeRenderer) HasVolume() bool                      { return r.hasVol }
-func (r *fakeRenderer) Volume(context.Context) (int, error)  { return 0, nil }
-func (r *fakeRenderer) SetVolume(context.Context, int) error { return nil }
-func (r *fakeRenderer) Mute(context.Context, bool) error     { return nil }
+func (s *fakeSession) Status(context.Context) (engine.State, error) { return s.st, nil }
+func (s *fakeSession) HasVolume() bool                              { return s.hasVol }
+func (s *fakeSession) Volume(context.Context) (int, error)          { return 0, nil }
+func (s *fakeSession) SetVolume(context.Context, int) error         { return nil }
+func (s *fakeSession) Mute(context.Context, bool) error             { return nil }
+func (s *fakeSession) Close() error                                 { s.closed++; return nil }
 
 type fakeServer struct {
 	calls         []string
@@ -173,126 +150,137 @@ func itoa(n int) string {
 	return string(b)
 }
 
-func device(name, host string) discovery.Device {
-	u, _ := url.Parse("http://" + host + "/desc.xml")
-	return discovery.Device{FriendlyName: name, Location: u}
-}
-
 // --- device resolution ---
 
 func TestSelectDeviceSole(t *testing.T) {
-	a := New(Options{Finder: fakeFinder{devices: []discovery.Device{device("TV", "10.0.0.5:1234")}}, Store: &fakeStore{}})
-	d, err := a.selectDevice(context.Background(), "")
+	a := New(Options{Finder: fakeFinder{devices: []engine.Device{device("TV", "10.0.0.5:1234")}}, Store: &fakeStore{}})
+	d, err := a.selectDevice(context.Background(), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.FriendlyName != "TV" {
-		t.Fatalf("got %q", d.FriendlyName)
+	if d.Name() != "TV" {
+		t.Fatalf("got %q", d.Name())
 	}
 }
 
 func TestSelectDevicePrefersSaved(t *testing.T) {
-	devs := []discovery.Device{device("A", "10.0.0.5:1"), device("B", "10.0.0.9:2")}
+	devs := []engine.Device{device("A", "10.0.0.5:1"), device("B", "10.0.0.9:2")}
 	a := New(Options{Finder: fakeFinder{devices: devs}, Store: &fakeStore{cfg: config.Config{LastDeviceHost: "10.0.0.9"}}})
-	d, err := a.selectDevice(context.Background(), "")
+	d, err := a.selectDevice(context.Background(), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.FriendlyName != "B" {
-		t.Fatalf("expected saved device B, got %q", d.FriendlyName)
+	if d.Name() != "B" {
+		t.Fatalf("expected saved device B, got %q", d.Name())
+	}
+}
+
+// Two engines can expose the same host (a TV that speaks both). A saved engine
+// disambiguates; an old config without one still matches by host alone.
+func TestSelectDevicePrefersSavedEngine(t *testing.T) {
+	dl := device("TV (dlna)", "10.0.0.5:1")
+	gc := device("TV (cast)", "10.0.0.5:8009")
+	gc.eng = "googlecast"
+	a := New(Options{
+		Finder: fakeFinder{devices: []engine.Device{dl, gc}},
+		Store:  &fakeStore{cfg: config.Config{LastDeviceHost: "10.0.0.5", LastDeviceEngine: "googlecast"}},
+	})
+	d, err := a.selectDevice(context.Background(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Engine() != "googlecast" {
+		t.Fatalf("expected the saved engine's device, got %s", d.Engine())
 	}
 }
 
 func TestSelectDeviceMultipleNoSavedErrors(t *testing.T) {
-	devs := []discovery.Device{device("A", "10.0.0.5:1"), device("B", "10.0.0.9:2")}
+	devs := []engine.Device{device("A", "10.0.0.5:1"), device("B", "10.0.0.9:2")}
 	a := New(Options{Finder: fakeFinder{devices: devs}, Store: &fakeStore{}})
-	if _, err := a.selectDevice(context.Background(), ""); err == nil {
+	if _, err := a.selectDevice(context.Background(), "", ""); err == nil {
 		t.Fatal("expected ambiguity error")
 	}
 }
 
 func TestSelectDeviceByHostIgnoresPort(t *testing.T) {
-	devs := []discovery.Device{device("TV", "10.0.0.5:1570")}
+	devs := []engine.Device{device("TV", "10.0.0.5:1570")}
 	a := New(Options{Finder: fakeFinder{devices: devs}, Store: &fakeStore{}})
 	// Target carries a stale port; match must be by host IP.
-	d, err := a.selectDevice(context.Background(), "10.0.0.5:9999")
+	d, err := a.selectDevice(context.Background(), "10.0.0.5:9999", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.FriendlyName != "TV" {
-		t.Fatalf("got %q", d.FriendlyName)
+	if d.Name() != "TV" {
+		t.Fatalf("got %q", d.Name())
 	}
 }
 
-func TestSelectTargetFallsBackToFindByHost(t *testing.T) {
-	// Multicast finds nothing and a bare IP has no port to load directly; the
-	// unicast host probe must resolve it (dynamic control port and all).
+func TestSelectTargetFallsBackToResolve(t *testing.T) {
+	// Discovery finds nothing; the engines' Resolve paths (unicast probe, direct
+	// connection) must recover the explicit target.
 	tv := device("TV", "10.0.0.5:1653")
-	a := New(Options{Finder: fakeFinder{byHost: &tv}, Store: &fakeStore{}})
-	d, err := a.selectDevice(context.Background(), "10.0.0.5")
+	a := New(Options{Finder: fakeFinder{resolved: tv}, Store: &fakeStore{}})
+	d, err := a.selectDevice(context.Background(), "10.0.0.5", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.FriendlyName != "TV" {
-		t.Fatalf("got %q", d.FriendlyName)
+	if d.Name() != "TV" {
+		t.Fatalf("got %q", d.Name())
 	}
 }
 
 func TestWaitForDeviceRecoversSavedHostViaProbe(t *testing.T) {
-	// The --resume case: a saved TV that the multicast search keeps missing is
-	// recovered by probing the saved host directly.
+	// The --resume case: a saved TV that broadcast discovery keeps missing is
+	// recovered by resolving the saved host directly.
 	tv := device("TV", "10.0.0.5:1653")
 	a := New(Options{
-		Finder: fakeFinder{byHost: &tv},
+		Finder: fakeFinder{resolved: tv},
 		Store:  &fakeStore{cfg: config.Config{LastDeviceHost: "10.0.0.5"}},
 	})
-	d, err := a.selectDevice(context.Background(), "")
+	d, err := a.selectDevice(context.Background(), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.FriendlyName != "TV" {
-		t.Fatalf("got %q", d.FriendlyName)
+	if d.Name() != "TV" {
+		t.Fatalf("got %q", d.Name())
 	}
 }
 
 // seqFinder returns a different result per Discover call, simulating a renderer
-// that misses the first SSDP burst and only answers a later one.
+// that misses the first search burst and only answers a later one.
 type seqFinder struct {
 	results []struct {
-		devices []discovery.Device
+		devices []engine.Device
 		err     error
 	}
 	n int
 }
 
-func (f *seqFinder) Discover(context.Context) ([]discovery.Device, error) {
+func (f *seqFinder) Discover(context.Context, string) ([]engine.Device, error) {
 	r := f.results[min(f.n, len(f.results)-1)]
 	f.n++
 	return r.devices, r.err
 }
-func (f *seqFinder) FindByURL(context.Context, *url.URL) (*discovery.Device, error) {
-	return nil, context.Canceled
-}
-func (f *seqFinder) FindByHost(context.Context, string) (*discovery.Device, error) {
+func (f *seqFinder) Resolve(context.Context, string, string) (engine.Device, error) {
 	return nil, context.Canceled
 }
 
 func TestSelectDeviceFallbackFindsLateRenderer(t *testing.T) {
 	f := &seqFinder{results: []struct {
-		devices []discovery.Device
+		devices []engine.Device
 		err     error
 	}{
 		{nil, nil}, // quick pass: nothing
-		{[]discovery.Device{device("TV", "10.0.0.5:1234")}, nil}, // deep pass: found
+		{[]engine.Device{device("TV", "10.0.0.5:1234")}, nil}, // deep pass: found
 	}}
 	var events []string
 	a := New(Options{Finder: f, Store: &fakeStore{}, OnEvent: func(e Event) { events = append(events, e.Message) }})
-	d, err := a.selectDevice(context.Background(), "")
+	d, err := a.selectDevice(context.Background(), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.FriendlyName != "TV" {
-		t.Fatalf("got %q", d.FriendlyName)
+	if d.Name() != "TV" {
+		t.Fatalf("got %q", d.Name())
 	}
 	found := false
 	for _, m := range events {
@@ -308,12 +296,12 @@ func TestSelectDeviceFallbackFindsLateRenderer(t *testing.T) {
 // --- seek-restart (the hard-won sequence) ---
 
 func TestSeekTranscodeRestartSequence(t *testing.T) {
-	r := &fakeRenderer{}
+	sess := &fakeSession{}
 	s := &fakeServer{}
 	built := []time.Duration{}
 	c := &Cast{
-		r:   r,
-		srv: s,
+		sess: sess,
+		srv:  s,
 		buildArgs: func(ss time.Duration) []string {
 			built = append(built, ss)
 			return []string{"-ss", ss.String()}
@@ -322,93 +310,38 @@ func TestSeekTranscodeRestartSequence(t *testing.T) {
 	if err := c.Seek(context.Background(), 90*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	// Renderer: Stop -> SetMedia -> Play.
-	want := []string{"Stop", "SetMedia", "Play"}
-	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
-		t.Fatalf("renderer calls = %v, want %v", r.calls, want)
+	// The engine session gets a fresh Load (which stops/settles internally) and
+	// a Play; the server got a fresh transcode at the seek offset.
+	want := []string{"Load", "Play"}
+	if strings.Join(sess.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("session calls = %v, want %v", sess.calls, want)
 	}
-	// Server got a fresh transcode at the seek offset.
 	if len(s.transcodeArgs) != 1 || len(built) != 1 || built[0] != 90*time.Second {
 		t.Fatalf("transcode not relaunched at 90s: built=%v", built)
 	}
 	if c.ssOffset != 90*time.Second {
 		t.Fatalf("ssOffset = %v, want 90s", c.ssOffset)
 	}
-}
-
-// A fresh cast must clear the TV's transport state (Stop) before pointing it at
-// new media, then Play — the sequence that avoids 701 "Transition not available".
-func TestStartPlaybackStopsThenSetsAndPlays(t *testing.T) {
-	r := &fakeRenderer{}
-	if err := startPlayback(context.Background(), r, renderer.Media{URL: "http://test/media.mp4"}); err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"Stop", "SetMedia", "Play"}
-	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
-		t.Fatalf("calls = %v, want %v", r.calls, want)
+	// The reloaded media must carry the fresh stream URL.
+	if !strings.Contains(sess.media.URL, "http://test/media.mp4") {
+		t.Fatalf("loaded media URL = %q", sess.media.URL)
 	}
 }
 
-// A 701 on the first SetAVTransportURI must be retried (after the Stop has had a
-// chance to clear the TV's state), not surfaced as a hard failure.
-func TestStartPlaybackRetriesTransientSetMedia(t *testing.T) {
-	r := &fakeRenderer{setMediaErrs: []error{context.DeadlineExceeded}} // first SetMedia fails, second succeeds
-	if err := startPlayback(context.Background(), r, renderer.Media{}); err != nil {
-		t.Fatalf("expected retry to recover, got %v", err)
-	}
-	want := []string{"Stop", "SetMedia", "SetMedia", "Play"}
-	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
-		t.Fatalf("calls = %v, want %v", r.calls, want)
-	}
-}
-
-// startPlayback must not issue SetAVTransportURI until the TV has left the
-// transitioning state — firing too early is what triggers 701. It should poll
-// TransportState past the LG_TRANSITIONING readings before setting the URI.
-func TestStartPlaybackWaitsForTransitionToSettle(t *testing.T) {
-	r := &fakeRenderer{stateSeq: []string{"LG_TRANSITIONING", "LG_TRANSITIONING", "STOPPED"}}
-	if err := startPlayback(context.Background(), r, renderer.Media{}); err != nil {
-		t.Fatal(err)
-	}
-	if r.stateCalls < 3 {
-		t.Fatalf("expected to poll TransportState until settled, polled %d time(s)", r.stateCalls)
-	}
-	want := []string{"Stop", "SetMedia", "Play"}
-	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
-		t.Fatalf("calls = %v, want %v", r.calls, want)
-	}
-}
-
-// Regression for the --resume 701: after SetAVTransportURI the TV buffers the
-// freshly-set URI and rejects Play with 701 while it reports LG_TRANSITIONING.
-// A live transcode resumed deep into the file lingers there well past the Play
-// retries, so startPlayback must wait for the transport to settle *between*
-// SetMedia and Play, not only before SetMedia.
-func TestStartPlaybackWaitsAfterSetMediaBeforePlay(t *testing.T) {
-	r := &fakeRenderer{transitioningAfterSet: 3} // TV transitions for 3 polls post-URI, rejecting Play until then
-	if err := startPlayback(context.Background(), r, renderer.Media{URL: "http://test/media.mp4"}); err != nil {
-		t.Fatalf("expected startPlayback to wait out the post-URI transition, got %v", err)
-	}
-	want := []string{"Stop", "SetMedia", "Play"}
-	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
-		t.Fatalf("calls = %v, want %v", r.calls, want)
-	}
-}
-
-// While the async start handshake is in flight (starting == true), the AVTransport
-// read/control methods must short-circuit without touching the renderer, so the
-// TUI can render and poll without contending with the in-flight Stop/SetURI/Play.
-func TestStartingGatesAVTransport(t *testing.T) {
-	r := &fakeRenderer{pos: 42 * time.Second, dur: 5 * time.Second, state: "PLAYING"}
-	c := &Cast{r: r, srv: &fakeServer{}, knownDuration: 3600 * time.Second}
+// While the async start handshake is in flight (starting == true), the
+// read/control methods must short-circuit without touching the session, so the
+// TUI can render and poll without contending with the in-flight Load/Play.
+func TestStartingGatesControls(t *testing.T) {
+	sess := &fakeSession{st: engine.State{Player: engine.StatePlaying, Pos: 42 * time.Second, Dur: 5 * time.Second}}
+	c := &Cast{sess: sess, srv: &fakeServer{}, knownDuration: 3600 * time.Second}
 	c.starting.Store(true)
 
 	pos, dur, err := c.Position(context.Background())
 	if err != nil || pos != 0 || dur != 3600*time.Second {
 		t.Fatalf("Position while starting = (%v,%v,%v), want (0, 3600s, nil)", pos, dur, err)
 	}
-	if st, _ := c.TransportState(context.Background()); st != "TRANSITIONING" {
-		t.Fatalf("TransportState while starting = %q, want TRANSITIONING", st)
+	if st, _ := c.PlayerState(context.Background()); st != engine.StateBuffering {
+		t.Fatalf("PlayerState while starting = %v, want StateBuffering", st)
 	}
 	if err := c.Play(context.Background()); err != nil {
 		t.Fatalf("Play while starting: %v", err)
@@ -416,32 +349,32 @@ func TestStartingGatesAVTransport(t *testing.T) {
 	if err := c.Seek(context.Background(), 30*time.Second); err != nil {
 		t.Fatalf("Seek while starting: %v", err)
 	}
-	if len(r.calls) != 0 {
-		t.Fatalf("expected no renderer calls while starting, got %v", r.calls)
+	if len(sess.calls) != 0 {
+		t.Fatalf("expected no session calls while starting, got %v", sess.calls)
 	}
 
-	// Once started, the same methods hit the renderer again.
+	// Once started, the same methods hit the session again.
 	c.starting.Store(false)
-	if st, _ := c.TransportState(context.Background()); st != "PLAYING" {
-		t.Fatalf("TransportState after start = %q, want PLAYING", st)
+	if st, _ := c.PlayerState(context.Background()); st != engine.StatePlaying {
+		t.Fatalf("PlayerState after start = %v, want StatePlaying", st)
 	}
 }
 
 func TestSeekDirectPlayNative(t *testing.T) {
-	r := &fakeRenderer{}
-	c := &Cast{r: r, srv: &fakeServer{}} // buildArgs nil => direct-play
+	sess := &fakeSession{}
+	c := &Cast{sess: sess, srv: &fakeServer{}} // buildArgs nil => direct-play
 	if err := c.Seek(context.Background(), 30*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if len(r.calls) != 1 || r.calls[0] != "Seek" || r.seekedTo != 30*time.Second {
-		t.Fatalf("expected native Seek to 30s, got calls=%v to=%v", r.calls, r.seekedTo)
+	if len(sess.calls) != 1 || sess.calls[0] != "Seek" || sess.seekedTo != 30*time.Second {
+		t.Fatalf("expected native Seek to 30s, got calls=%v to=%v", sess.calls, sess.seekedTo)
 	}
 }
 
 func TestPositionTranscodeAddsOffset(t *testing.T) {
-	r := &fakeRenderer{pos: 10 * time.Second, dur: 5 * time.Second}
+	sess := &fakeSession{st: engine.State{Pos: 10 * time.Second, Dur: 5 * time.Second}}
 	c := &Cast{
-		r:             r,
+		sess:          sess,
 		srv:           &fakeServer{},
 		buildArgs:     func(time.Duration) []string { return nil },
 		knownDuration: 3600 * time.Second,
@@ -459,11 +392,37 @@ func TestPositionTranscodeAddsOffset(t *testing.T) {
 	}
 }
 
+// Position and PlayerState back to back must cost one session Status, not two:
+// the cache is what keeps the per-poll device traffic the same as before.
+func TestStatusCacheCoalescesPolls(t *testing.T) {
+	sess := &statusCountingSession{fakeSession: fakeSession{st: engine.State{Player: engine.StatePlaying, Pos: time.Second, Dur: time.Minute}}}
+	c := &Cast{sess: sess, srv: &fakeServer{}}
+	if _, _, err := c.Position(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.PlayerState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if sess.statusCalls != 1 {
+		t.Fatalf("status calls = %d, want 1 (cached)", sess.statusCalls)
+	}
+}
+
+type statusCountingSession struct {
+	fakeSession
+	statusCalls int
+}
+
+func (s *statusCountingSession) Status(ctx context.Context) (engine.State, error) {
+	s.statusCalls++
+	return s.fakeSession.Status(ctx)
+}
+
 // --- subtitle application + events ---
 
 func TestApplySubtitlesBurn(t *testing.T) {
 	s := &fakeServer{}
-	media := &renderer.Media{Seekable: true, MIME: "video/x-matroska"}
+	media := &engine.Media{Seekable: true, MIME: "video/x-matroska"}
 	track := probe.SubTrack{SubIndex: 1, Codec: "hdmv_pgs_subtitle", Kind: probe.SubBitmap}
 	dec := subs.Decision{Kind: subs.Burn, Track: &track}
 
@@ -487,7 +446,7 @@ func TestApplySubtitlesBurn(t *testing.T) {
 
 func TestApplySubtitlesSidecar(t *testing.T) {
 	s := &fakeServer{}
-	media := &renderer.Media{}
+	media := &engine.Media{}
 	dec := subs.Decision{Kind: subs.SoftSidecar, Format: engine.SubFormatSRT, SidecarPath: "/x/movie.srt"}
 
 	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0, 0)
@@ -497,8 +456,8 @@ func TestApplySubtitlesSidecar(t *testing.T) {
 	if build != nil {
 		t.Fatal("sidecar must not transcode")
 	}
-	if media.SubURL == "" || media.SubType != "srt" {
-		t.Fatalf("expected soft sub set, got url=%q type=%q", media.SubURL, media.SubType)
+	if media.Subtitle == nil || media.Subtitle.URL == "" || media.Subtitle.Format != engine.SubFormatSRT {
+		t.Fatalf("expected soft sub set, got %+v", media.Subtitle)
 	}
 	if label != "soft: movie.srt" {
 		t.Fatalf("label = %q", label)
@@ -510,7 +469,7 @@ func TestApplySubtitlesSidecar(t *testing.T) {
 
 func TestApplySubtitlesNone(t *testing.T) {
 	s := &fakeServer{}
-	media := &renderer.Media{Seekable: true}
+	media := &engine.Media{Seekable: true}
 	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), subs.Decision{Kind: subs.None}, 0, 0)
 	if err != nil || label != "" || build != nil {
 		t.Fatalf("None: label=%q build!=nil=%v err=%v", label, build != nil, err)
@@ -526,7 +485,7 @@ func TestApplySubtitlesNone(t *testing.T) {
 func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
 	a := New(Options{})
 	s := &fakeServer{}
-	media := &renderer.Media{}
+	media := &engine.Media{}
 	info := &probe.MediaInfo{
 		Subtitles: []probe.SubTrack{{SubIndex: 0, Codec: "hdmv_pgs_subtitle", Kind: probe.SubBitmap}},
 	}
@@ -535,15 +494,15 @@ func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
 	off := SubtitleOptions{NoSubs: true, TrackIndex: -1}
 
 	assertSoft := func() {
-		_, build, _, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, soft, false, 0)
+		_, build, _, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, soft, false, 0, defaultProfile)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if build != nil {
 			t.Fatal("soft must direct-play (build nil)")
 		}
-		if media.SubURL == "" || media.SubType != "srt" {
-			t.Fatalf("soft: subURL=%q type=%q", media.SubURL, media.SubType)
+		if media.Subtitle == nil || media.Subtitle.Format != engine.SubFormatSRT {
+			t.Fatalf("soft: subtitle = %+v", media.Subtitle)
 		}
 		if !media.Seekable || media.MIME != "video/x-matroska" {
 			t.Fatalf("soft: seekable=%v mime=%q (want original)", media.Seekable, media.MIME)
@@ -553,30 +512,30 @@ func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
 	assertSoft()
 
 	// soft -> burn: media flips to non-seekable mp4 with subs cleared, build set.
-	_, build, _, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, burn, false, 30*time.Second)
+	_, build, _, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, burn, false, 30*time.Second, defaultProfile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if build == nil {
 		t.Fatal("burn must transcode (build set)")
 	}
-	if media.SubURL != "" {
-		t.Fatalf("burn must clear soft subURL, got %q", media.SubURL)
+	if media.Subtitle != nil {
+		t.Fatalf("burn must clear the soft subtitle, got %+v", media.Subtitle)
 	}
 	if media.Seekable || media.MIME != "video/mp4" {
 		t.Fatalf("burn: seekable=%v mime=%q", media.Seekable, media.MIME)
 	}
 
 	// burn -> off: back to a clean direct-play baseline, no subs, no transcode.
-	_, build, _, err = a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, off, false, 0)
+	_, build, _, err = a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, off, false, 0, defaultProfile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if build != nil {
 		t.Fatal("off must direct-play (build nil)")
 	}
-	if media.SubURL != "" {
-		t.Fatalf("off must clear subURL, got %q", media.SubURL)
+	if media.Subtitle != nil {
+		t.Fatalf("off must clear the subtitle, got %+v", media.Subtitle)
 	}
 	if !media.Seekable || media.MIME != "video/x-matroska" {
 		t.Fatalf("off: seekable=%v mime=%q (want original)", media.Seekable, media.MIME)
@@ -587,7 +546,7 @@ func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
 }
 
 func TestSetSubtitleDirectPlayChoice(t *testing.T) {
-	r := &fakeRenderer{}
+	sess := &fakeSession{}
 	s := &fakeServer{}
 	a := New(Options{})
 	info := &probe.MediaInfo{
@@ -595,7 +554,7 @@ func TestSetSubtitleDirectPlayChoice(t *testing.T) {
 	}
 	choices := buildSubChoices(info, "/x/movie.srt") // [sidecar, track s:0 (bitmap), off]
 	c := &Cast{
-		r: r, srv: s, app: a, abs: "/x/movie.mkv",
+		sess: sess, srv: s, app: a, abs: "/x/movie.mkv", profile: defaultProfile,
 		info: info, subChoices: choices, lastPos: 50 * time.Second,
 		buildArgs: func(time.Duration) []string { return nil }, // start in some transcode mode
 		ssOffset:  10 * time.Second, activeSub: 1,
@@ -605,12 +564,12 @@ func TestSetSubtitleDirectPlayChoice(t *testing.T) {
 	if err := c.SetSubtitle(context.Background(), 0); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"Stop", "SetMedia", "Play", "Seek"}
-	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
-		t.Fatalf("calls = %v, want %v", r.calls, want)
+	want := []string{"Load", "Play", "Seek"}
+	if strings.Join(sess.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", sess.calls, want)
 	}
-	if r.seekedTo != 50*time.Second {
-		t.Fatalf("resumed at %v, want 50s", r.seekedTo)
+	if sess.seekedTo != 50*time.Second {
+		t.Fatalf("resumed at %v, want 50s", sess.seekedTo)
 	}
 	if c.buildArgs != nil {
 		t.Fatal("direct-play choice must clear buildArgs")
@@ -623,8 +582,33 @@ func TestSetSubtitleDirectPlayChoice(t *testing.T) {
 	}
 }
 
+// An engine that honors StartAt gets the resume position baked into the Load
+// instead of a post-Play seek.
+func TestSetSubtitleStartAtEngine(t *testing.T) {
+	sess := &fakeSession{}
+	s := &fakeServer{}
+	a := New(Options{})
+	prof := defaultProfile
+	prof.HonorsStartAt = true
+	choices := buildSubChoices(nil, "/x/movie.srt")
+	c := &Cast{
+		sess: sess, srv: s, app: a, abs: "/x/movie.mkv", profile: prof,
+		subChoices: choices, lastPos: 50 * time.Second,
+	}
+	if err := c.SetSubtitle(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Load", "Play"} // no Seek: StartAt does it
+	if strings.Join(sess.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", sess.calls, want)
+	}
+	if sess.media.StartAt != 50*time.Second {
+		t.Fatalf("StartAt = %v, want 50s", sess.media.StartAt)
+	}
+}
+
 func TestSetSubtitleTranscodeChoice(t *testing.T) {
-	r := &fakeRenderer{}
+	sess := &fakeSession{}
 	s := &fakeServer{}
 	a := New(Options{})
 	info := &probe.MediaInfo{
@@ -632,7 +616,7 @@ func TestSetSubtitleTranscodeChoice(t *testing.T) {
 	}
 	choices := buildSubChoices(info, "/x/movie.srt") // [sidecar, track s:0 (bitmap), off]
 	c := &Cast{
-		r: r, srv: s, app: a, abs: "/x/movie.mkv",
+		sess: sess, srv: s, app: a, abs: "/x/movie.mkv", profile: defaultProfile,
 		info: info, subChoices: choices, lastPos: 50 * time.Second,
 	}
 
@@ -640,9 +624,9 @@ func TestSetSubtitleTranscodeChoice(t *testing.T) {
 	if err := c.SetSubtitle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"Stop", "SetMedia", "Play"} // no native Seek in transcode mode
-	if strings.Join(r.calls, ",") != strings.Join(want, ",") {
-		t.Fatalf("calls = %v, want %v", r.calls, want)
+	want := []string{"Load", "Play"} // no native Seek in transcode mode
+	if strings.Join(sess.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", sess.calls, want)
 	}
 	if c.buildArgs == nil {
 		t.Fatal("burn choice must set buildArgs")
@@ -723,16 +707,20 @@ func TestResumeOffset(t *testing.T) {
 
 func TestCloseSavesPosition(t *testing.T) {
 	fr := &fakeResume{}
-	c := &Cast{srv: &fakeServer{}, resume: fr, resumePath: "/x/movie.mkv", knownDuration: 3600 * time.Second, lastPos: 100 * time.Second}
+	sess := &fakeSession{}
+	c := &Cast{sess: sess, srv: &fakeServer{}, resume: fr, resumePath: "/x/movie.mkv", knownDuration: 3600 * time.Second, lastPos: 100 * time.Second}
 	_ = c.Close(context.Background())
 	if fr.got["/x/movie.mkv"] != 100*time.Second {
 		t.Fatalf("saved = %v, want 100s", fr.got["/x/movie.mkv"])
+	}
+	if sess.closed != 1 {
+		t.Fatalf("session closed %d times, want 1", sess.closed)
 	}
 }
 
 func TestCloseClearsWhenFinished(t *testing.T) {
 	fr := &fakeResume{}
-	c := &Cast{srv: &fakeServer{}, resume: fr, resumePath: "/x/movie.mkv", knownDuration: 3600 * time.Second, lastPos: 3595 * time.Second}
+	c := &Cast{sess: &fakeSession{}, srv: &fakeServer{}, resume: fr, resumePath: "/x/movie.mkv", knownDuration: 3600 * time.Second, lastPos: 3595 * time.Second}
 	_ = c.Close(context.Background())
 	if len(fr.cleared) != 1 || fr.cleared[0] != "/x/movie.mkv" {
 		t.Fatalf("expected clear of finished file, got cleared=%v set=%v", fr.cleared, fr.got)
@@ -741,7 +729,7 @@ func TestCloseClearsWhenFinished(t *testing.T) {
 
 func TestCloseSkipsTinyPosition(t *testing.T) {
 	fr := &fakeResume{}
-	c := &Cast{srv: &fakeServer{}, resume: fr, resumePath: "/x/movie.mkv", knownDuration: 3600 * time.Second, lastPos: 2 * time.Second}
+	c := &Cast{sess: &fakeSession{}, srv: &fakeServer{}, resume: fr, resumePath: "/x/movie.mkv", knownDuration: 3600 * time.Second, lastPos: 2 * time.Second}
 	_ = c.Close(context.Background())
 	if len(fr.got) != 0 || len(fr.cleared) != 0 {
 		t.Fatalf("tiny position should neither set nor clear: set=%v cleared=%v", fr.got, fr.cleared)
@@ -749,8 +737,8 @@ func TestCloseSkipsTinyPosition(t *testing.T) {
 }
 
 func TestPositionCachesLastPos(t *testing.T) {
-	r := &fakeRenderer{pos: 30 * time.Second, dur: 100 * time.Second}
-	c := &Cast{r: r, srv: &fakeServer{}} // direct-play
+	sess := &fakeSession{st: engine.State{Pos: 30 * time.Second, Dur: 100 * time.Second}}
+	c := &Cast{sess: sess, srv: &fakeServer{}} // direct-play
 	if _, _, err := c.Position(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -791,7 +779,7 @@ var _ interface {
 	Stop(context.Context) error
 	Seek(context.Context, time.Duration) error
 	Position(context.Context) (time.Duration, time.Duration, error)
-	TransportState(context.Context) (string, error)
+	PlayerState(context.Context) (engine.PlayerState, error)
 	HasVolume() bool
 	Volume(context.Context) (int, error)
 	SetVolume(context.Context, int) error
@@ -822,9 +810,9 @@ func TestSoftSubOffsetFollowsTranscode(t *testing.T) {
 	// av1 => codec transcode; the sidecar must be shifted by the 85s start offset.
 	a := New(Options{})
 	s := &fakeServer{}
-	media := &renderer.Media{}
+	media := &engine.Media{}
 	_, build, resoft, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(),
-		&probe.MediaInfo{VideoCodec: "av1", AudioCodec: "eac3"}, soft, false, 85*time.Second)
+		&probe.MediaInfo{VideoCodec: "av1", AudioCodec: "eac3"}, soft, false, 85*time.Second, defaultProfile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -840,8 +828,8 @@ func TestSoftSubOffsetFollowsTranscode(t *testing.T) {
 
 	// h264 => direct-play; the sidecar must be served as-is.
 	s2 := &fakeServer{}
-	_, build2, _, err := a.buildDelivery(s2, &renderer.Media{}, "/x/movie.mkv", t.TempDir(),
-		&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "eac3"}, soft, false, 85*time.Second)
+	_, build2, _, err := a.buildDelivery(s2, &engine.Media{}, "/x/movie.mkv", t.TempDir(),
+		&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "eac3"}, soft, false, 85*time.Second, defaultProfile)
 	if err != nil {
 		t.Fatal(err)
 	}

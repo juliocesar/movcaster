@@ -9,6 +9,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/juliocesar/movcaster/internal/engine"
 )
 
 // fakeCtrl records Seek calls and satisfies Controller.
@@ -26,7 +27,9 @@ func (f *fakeCtrl) Seek(_ context.Context, d time.Duration) error {
 func (f *fakeCtrl) Position(context.Context) (time.Duration, time.Duration, error) {
 	return 0, 0, nil
 }
-func (f *fakeCtrl) TransportState(context.Context) (string, error) { return "PLAYING", nil }
+func (f *fakeCtrl) PlayerState(context.Context) (engine.PlayerState, error) {
+	return engine.StatePlaying, nil
+}
 func (f *fakeCtrl) HasVolume() bool                                { return true }
 func (f *fakeCtrl) Volume(context.Context) (int, error)            { return 0, nil }
 func (f *fakeCtrl) SetVolume(context.Context, int) error           { return nil }
@@ -185,7 +188,7 @@ func TestSeekDebounce(t *testing.T) {
 	}
 
 	// A position poll during seeking must not overwrite the target.
-	mi, _ = m.Update(posMsg{pos: 5 * time.Second, dur: 100 * time.Second, state: "PLAYING"})
+	mi, _ = m.Update(posMsg{pos: 5 * time.Second, dur: 100 * time.Second, state: engine.StatePlaying})
 	m = mi.(model)
 	if m.pos != 30*time.Second {
 		t.Fatalf("poll overwrote pending target: %v", m.pos)
@@ -218,14 +221,14 @@ func TestEndOfMediaAdvances(t *testing.T) {
 	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress()}
 
 	// Play through to near the end.
-	mi, _ := m.Update(posMsg{pos: 90 * time.Second, dur: 100 * time.Second, state: "PLAYING"})
+	mi, _ := m.Update(posMsg{pos: 90 * time.Second, dur: 100 * time.Second, state: engine.StatePlaying})
 	m = mi.(model)
 	if !m.everPlayed || m.maxProgress != 90*time.Second {
 		t.Fatalf("everPlayed=%v maxProgress=%v", m.everPlayed, m.maxProgress)
 	}
 
 	// The TV stops near the end (and may reset its reported position to 0).
-	mi, cmd := m.Update(posMsg{pos: 0, dur: 100 * time.Second, state: "STOPPED"})
+	mi, cmd := m.Update(posMsg{pos: 0, dur: 100 * time.Second, state: engine.StateStopped})
 	m = mi.(model)
 	if cmd == nil {
 		t.Fatal("end-of-media did not return a quit command")
@@ -235,10 +238,21 @@ func TestEndOfMediaAdvances(t *testing.T) {
 	}
 }
 
+// An engine that reports StateFinished (Cast's idleReason FINISHED) ends the
+// cast without the played-to-the-end inference: no everPlayed, no endGuard.
+func TestFinishedStateEndsDirectly(t *testing.T) {
+	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress()}
+	mi, cmd := m.Update(posMsg{pos: 0, dur: 100 * time.Second, state: engine.StateFinished})
+	m = mi.(model)
+	if cmd == nil || m.outcome != OutcomeEnded || !m.quitting {
+		t.Fatalf("StateFinished did not end: outcome=%v quitting=%v", m.outcome, m.quitting)
+	}
+}
+
 func TestStoppedBeforePlayingDoesNotEnd(t *testing.T) {
 	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress()}
 	// A STOPPED state before anything ever played (startup) must not advance.
-	mi, cmd := m.Update(posMsg{pos: 0, dur: 100 * time.Second, state: "STOPPED"})
+	mi, cmd := m.Update(posMsg{pos: 0, dur: 100 * time.Second, state: engine.StateStopped})
 	m = mi.(model)
 	if cmd != nil || m.outcome != OutcomeQuit || m.quitting {
 		t.Fatalf("startup STOPPED ended prematurely: outcome=%v quitting=%v", m.outcome, m.quitting)
@@ -248,9 +262,9 @@ func TestStoppedBeforePlayingDoesNotEnd(t *testing.T) {
 func TestEarlyStopDoesNotEnd(t *testing.T) {
 	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress()}
 	// Played only a little, then stopped far from the end: not a natural end.
-	mi, _ := m.Update(posMsg{pos: 10 * time.Second, dur: 100 * time.Second, state: "PLAYING"})
+	mi, _ := m.Update(posMsg{pos: 10 * time.Second, dur: 100 * time.Second, state: engine.StatePlaying})
 	m = mi.(model)
-	mi, cmd := m.Update(posMsg{pos: 10 * time.Second, dur: 100 * time.Second, state: "STOPPED"})
+	mi, cmd := m.Update(posMsg{pos: 10 * time.Second, dur: 100 * time.Second, state: engine.StateStopped})
 	m = mi.(model)
 	if cmd != nil || m.outcome != OutcomeQuit {
 		t.Fatalf("early stop wrongly treated as end: outcome=%v", m.outcome)
@@ -274,7 +288,7 @@ func TestViewRendersState(t *testing.T) {
 		title:   "Movie.mkv",
 		device:  "TV",
 		subInfo: "burn-in: track 0",
-		state:   "PLAYING",
+		state:   engine.StatePlaying,
 		pos:     90 * time.Second,
 		dur:     2700 * time.Second,
 		volume:  42,
@@ -457,7 +471,7 @@ func TestSubMenuScrollsLongList(t *testing.T) {
 	choices[43] = "Off"
 	f := &fakeSubCtrl{choices: choices, active: 30}
 
-	m := model{ctrl: f, state: "PLAYING", width: 100, height: 24,
+	m := model{ctrl: f, state: engine.StatePlaying, width: 100, height: 24,
 		prog: progress.New(progress.WithWidth(50))}
 	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 	m = mi.(model)
@@ -502,7 +516,7 @@ func TestSubMenuJumpToEnd(t *testing.T) {
 	}
 	choices[43] = "Off"
 	f := &fakeSubCtrl{choices: choices, active: 0}
-	m := model{ctrl: f, state: "PLAYING", width: 100, height: 24,
+	m := model{ctrl: f, state: engine.StatePlaying, width: 100, height: 24,
 		prog: progress.New(progress.WithWidth(50))}
 	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 	m = mi.(model)
@@ -524,7 +538,7 @@ func TestSubMenuPagingStaysInBounds(t *testing.T) {
 		choices[i] = fmt.Sprintf("Track s:%d", i)
 	}
 	f := &fakeSubCtrl{choices: choices, active: 0}
-	m := model{ctrl: f, state: "PLAYING", width: 100, height: 24,
+	m := model{ctrl: f, state: engine.StatePlaying, width: 100, height: 24,
 		prog: progress.New(progress.WithWidth(50))}
 	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 	m = mi.(model)

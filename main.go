@@ -1,5 +1,5 @@
-// movcaster streams local video to a DLNA renderer (e.g. an LG webOS TV) with
-// soft and burned-in subtitle support. CLI/TUI only.
+// movcaster streams local video to a TV (DLNA/webOS, Google Cast) with soft
+// and burned-in subtitle support. CLI/TUI only.
 //
 // This file is a thin client over internal/core: it parses flags, maps them to a
 // core.CastRequest, renders core events, and drives the TUI. All orchestration
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/juliocesar/movcaster/internal/core"
+	_ "github.com/juliocesar/movcaster/internal/engine/all"
 	"github.com/juliocesar/movcaster/internal/nextep"
 	"github.com/juliocesar/movcaster/internal/playlist"
 	"github.com/juliocesar/movcaster/internal/resume"
@@ -27,9 +28,10 @@ var version = "dev"
 
 func main() {
 	var (
-		list       = flag.Bool("l", false, "list DLNA renderers on the LAN and exit")
+		list       = flag.Bool("l", false, "list TVs on the LAN and exit")
 		showVer    = flag.Bool("version", false, "print version and exit")
-		target     = flag.String("t", "", "target device: IP, IP:port, or device description URL")
+		target     = flag.String("t", "", "target device: IP, IP:port, engine:host, or device description URL")
+		engineName = flag.String("engine", "", "restrict discovery/target resolution to one engine (dlna, googlecast)")
 		sub        = flag.String("sub", "", "subtitle file to use as soft subs (.srt/.vtt)")
 		noSubs     = flag.Bool("no-subs", false, "do not send any subtitles")
 		burn       = flag.Bool("burn", false, "burn the selected subtitle track into the video")
@@ -62,7 +64,7 @@ func main() {
 	app := core.New(opts)
 
 	if *list {
-		fail(runList(app))
+		fail(runList(app, *engineName))
 		return
 	}
 
@@ -71,6 +73,7 @@ func main() {
 	// cleared when advancing).
 	base := core.CastRequest{
 		Target:         *target,
+		Engine:         *engineName,
 		ForceTranscode: *tcode,
 		Subtitle: core.SubtitleOptions{
 			Sidecar:    *sub,
@@ -161,14 +164,15 @@ func report(e core.Event) {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `movcaster - stream local video to a DLNA renderer (e.g. an LG webOS TV)
+	fmt.Fprint(os.Stderr, `movcaster - stream local video to a TV (DLNA/webOS, Google Cast)
 
 Usage:
-  movcaster -l                       list renderers
+  movcaster -l                       list TVs
   movcaster <file>                   cast (auto subs, auto codec fallback)
   movcaster --resume                 continue the last played video
   movcaster --resume-last PATTERN    continue the last played video matching PATTERN
-  movcaster <file> -t TARGET         target a device (IP, IP:port, or device URL)
+  movcaster <file> -t TARGET         target a device (IP, IP:port, engine:host, or device URL)
+  movcaster <file> --engine NAME     restrict to one engine (dlna, googlecast)
   movcaster <file> --info            show streams + chosen subtitle strategy
   movcaster <file> --sub foo.srt     force an explicit soft subtitle
   movcaster <file> --sub-track N     pick embedded subtitle track N (see --info)
@@ -210,40 +214,50 @@ func fail(err error) {
 	}
 }
 
-func runList(app *core.App) error {
+func runList(app *core.App, only string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	devices, err := app.ListDevices(ctx)
+	devices, err := app.ListDevices(ctx, only)
 	if err != nil {
 		return err
 	}
 	if len(devices) == 0 {
-		fmt.Println("No DLNA renderers found.")
+		fmt.Println("No TVs found.")
 		return nil
 	}
-	fmt.Printf("Found %d renderer(s):\n", len(devices))
+	fmt.Printf("Found %d device(s):\n", len(devices))
 	for i, d := range devices {
-		host := ""
-		if d.Location != nil {
-			host = d.Location.Host
-		}
 		extra := ""
-		if d.Rendering == nil {
+		// Volume control is an optional per-device capability some engines can
+		// tell without opening a session.
+		if hv, ok := d.(interface{ HasVolumeControl() bool }); ok && !hv.HasVolumeControl() {
 			extra = "  (no volume control)"
 		}
-		fmt.Printf("  %d. %s  [%s]%s\n", i+1, d.FriendlyName, host, extra)
+		fmt.Printf("  %d. %s  [%s]  (%s)%s\n", i+1, d.Name(), d.Addr(), d.Engine(), extra)
 	}
 	return nil
 }
 
 // runInfo probes the file and prints its streams and the subtitle decision.
+// With -t it resolves the device first and plans against its real profile;
+// without it, the plan uses the default profile and says which one.
 func runInfo(app *core.App, req core.CastRequest) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	if err := app.Doctor(ctx); err != nil {
 		return err
 	}
-	prep, err := app.Prepare(ctx, req)
+	var prep *core.Preparation
+	var err error
+	if req.Target != "" {
+		dev, derr := app.ResolveDevice(ctx, req.Target, req.Engine)
+		if derr != nil {
+			return derr
+		}
+		prep, err = app.PrepareWithProfile(ctx, req, dev.Profile(), dev.Engine())
+	} else {
+		prep, err = app.Prepare(ctx, req)
+	}
 	if err != nil {
 		return err
 	}
@@ -254,6 +268,7 @@ func runInfo(app *core.App, req core.CastRequest) error {
 	if prep.DecideErr != nil {
 		return prep.DecideErr
 	}
+	fmt.Print(prep.DescribeProfile())
 	fmt.Print(prep.DescribeStrategy())
 	fmt.Print(prep.DescribeCodec())
 	return nil

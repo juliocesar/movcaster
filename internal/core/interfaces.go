@@ -4,46 +4,30 @@
 // toolkit and never prints; progress is reported through Options.OnEvent and
 // status is read back through the live Cast handle.
 //
-// The CLI/TUI in package main is a thin client over this package. A future HTTP
-// daemon or GUI would consume the same surface.
+// Core talks to TVs only through the engine contract (internal/engine): it never
+// imports a concrete engine. The CLI/TUI in package main is a thin client over
+// this package; a future HTTP daemon or GUI would consume the same surface.
 package core
 
 import (
 	"context"
-	"net/url"
 	"time"
 
 	"github.com/juliocesar/movcaster/internal/config"
-	"github.com/juliocesar/movcaster/internal/discovery"
+	"github.com/juliocesar/movcaster/internal/engine"
 	"github.com/juliocesar/movcaster/internal/mediaserver"
-	"github.com/juliocesar/movcaster/internal/renderer"
 	"github.com/juliocesar/movcaster/internal/resume"
 )
 
-// DeviceFinder discovers DLNA renderers. The production impl wraps the discovery
-// package; tests inject a fake to resolve devices without a real network.
+// DeviceFinder discovers renderers across all registered engines. The
+// production impl wraps the engine registry; tests inject a fake to resolve
+// devices without a real network.
 type DeviceFinder interface {
-	Discover(ctx context.Context) ([]discovery.Device, error)
-	FindByURL(ctx context.Context, loc *url.URL) (*discovery.Device, error)
-	// FindByHost resolves a renderer by host/IP via a unicast SSDP probe,
-	// bypassing multicast discovery (which webOS drops right after wake).
-	FindByHost(ctx context.Context, host string) (*discovery.Device, error)
-}
-
-// RendererControl is the transport/volume control surface of a renderer.
-// *renderer.Renderer satisfies it; tests inject a fake.
-type RendererControl interface {
-	SetMedia(ctx context.Context, m renderer.Media) error
-	Play(ctx context.Context) error
-	Pause(ctx context.Context) error
-	Stop(ctx context.Context) error
-	Seek(ctx context.Context, pos time.Duration) error
-	Position(ctx context.Context) (pos, dur time.Duration, err error)
-	TransportState(ctx context.Context) (string, error)
-	HasVolume() bool
-	Volume(ctx context.Context) (int, error)
-	SetVolume(ctx context.Context, v int) error
-	Mute(ctx context.Context, on bool) error
+	// Discover finds devices on the LAN. only restricts to one engine ("" = all).
+	Discover(ctx context.Context, only string) ([]engine.Device, error)
+	// Resolve builds a device from an explicit target (bare IP, host:port,
+	// engine:host, or an engine-specific URL) without a broadcast search.
+	Resolve(ctx context.Context, target, onlyEngine string) (engine.Device, error)
 }
 
 // MediaServer is the local HTTP server that the TV pulls media/subs from.
@@ -78,23 +62,26 @@ var _ resumeStore = (*resume.Store)(nil)
 
 // Concrete impls satisfy the interfaces (compile-time checks).
 var (
-	_ DeviceFinder    = realFinder{}
-	_ RendererControl = (*renderer.Renderer)(nil)
-	_ MediaServer     = (*mediaserver.Server)(nil)
-	_ Store           = configStore{}
+	_ DeviceFinder = realFinder{}
+	_ MediaServer  = (*mediaserver.Server)(nil)
+	_ Store        = configStore{}
 )
 
-// realFinder wraps the discovery package's SSDP functions.
+// realFinder wraps the engine registry.
 type realFinder struct{}
 
-func (realFinder) Discover(ctx context.Context) ([]discovery.Device, error) {
-	return discovery.Discover(ctx)
+func (realFinder) Discover(ctx context.Context, only string) ([]engine.Device, error) {
+	devices, errs := engine.DiscoverAll(ctx, only)
+	// A single engine's failure is not fatal (a broken mDNS stack must not stop
+	// DLNA discovery); only surface an error when nothing was found at all.
+	if len(devices) == 0 && len(errs) > 0 {
+		return nil, errs[0]
+	}
+	return devices, nil
 }
-func (realFinder) FindByURL(ctx context.Context, loc *url.URL) (*discovery.Device, error) {
-	return discovery.FindByURL(ctx, loc)
-}
-func (realFinder) FindByHost(ctx context.Context, host string) (*discovery.Device, error) {
-	return discovery.FindByHost(ctx, host)
+
+func (realFinder) Resolve(ctx context.Context, target, onlyEngine string) (engine.Device, error) {
+	return engine.ResolveTarget(ctx, target, onlyEngine)
 }
 
 // configStore wraps the config package.
