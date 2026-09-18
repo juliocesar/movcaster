@@ -12,6 +12,7 @@ import (
 
 	"github.com/juliocesar/movcaster/internal/config"
 	"github.com/juliocesar/movcaster/internal/discovery"
+	"github.com/juliocesar/movcaster/internal/engine"
 	"github.com/juliocesar/movcaster/internal/probe"
 	"github.com/juliocesar/movcaster/internal/renderer"
 	"github.com/juliocesar/movcaster/internal/subs"
@@ -487,7 +488,7 @@ func TestApplySubtitlesBurn(t *testing.T) {
 func TestApplySubtitlesSidecar(t *testing.T) {
 	s := &fakeServer{}
 	media := &renderer.Media{}
-	dec := subs.Decision{Kind: subs.SoftSidecar, SidecarPath: "/x/movie.srt"}
+	dec := subs.Decision{Kind: subs.SoftSidecar, Format: engine.SubFormatSRT, SidecarPath: "/x/movie.srt"}
 
 	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0, 0)
 	if err != nil {
@@ -759,20 +760,27 @@ func TestPositionCachesLastPos(t *testing.T) {
 }
 
 func TestCodecPlan(t *testing.T) {
-	// av1 video is outside the good list -> transcode video only.
-	p := codecPlan(&probe.MediaInfo{VideoCodec: "av1", AudioCodec: "aac"}, false)
+	// av1 video is outside the webOS list -> transcode video only.
+	p := codecPlan(&probe.MediaInfo{VideoCodec: "av1", AudioCodec: "aac"}, defaultProfile, false)
 	if p.Kind != TranscodeCodec || !p.Video || p.Audio {
 		t.Fatalf("av1/aac: %+v", p)
 	}
 	// All good -> none.
-	p = codecPlan(&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "aac"}, false)
+	p = codecPlan(&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "aac"}, defaultProfile, false)
 	if p.Kind != TranscodeNone {
 		t.Fatalf("h264/aac should not transcode: %+v", p)
 	}
 	// Forced -> both.
-	p = codecPlan(&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "aac"}, true)
+	p = codecPlan(&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "aac"}, defaultProfile, true)
 	if p.Kind != TranscodeCodec || !p.Video || !p.Audio {
 		t.Fatalf("forced: %+v", p)
+	}
+	// Container mismatch alone (a Cast-style profile) -> remux.
+	castish := defaultProfile
+	castish.Containers = codecSet("mp4", "webm")
+	p = codecPlan(&probe.MediaInfo{Container: "matroska", VideoCodec: "h264", AudioCodec: "aac"}, castish, false)
+	if p.Kind != TranscodeRemux || !p.Remux || p.Video || p.Audio {
+		t.Fatalf("mkv/h264/aac on a container-limited profile: %+v", p)
 	}
 }
 

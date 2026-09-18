@@ -5,6 +5,7 @@ package subs
 import (
 	"fmt"
 
+	"github.com/juliocesar/movcaster/internal/engine"
 	"github.com/juliocesar/movcaster/internal/probe"
 )
 
@@ -37,7 +38,8 @@ func (k Kind) String() string {
 // Request holds the inputs to the decision.
 type Request struct {
 	Info        *probe.MediaInfo
-	SidecarPath string // resolved sidecar/--sub path, or ""
+	Profile     engine.Profile // the target device's capabilities (SubFormats drives soft vs burn)
+	SidecarPath string         // resolved sidecar/--sub path, or ""
 	NoSubs      bool
 	ForceBurn   bool // --burn
 	ForceSoft   bool // --soft (error if chosen track is bitmap)
@@ -48,20 +50,29 @@ type Request struct {
 // Decision is the outcome of Decide.
 type Decision struct {
 	Kind        Kind
-	SidecarPath string          // for SoftSidecar
-	Track       *probe.SubTrack // for SoftExtract/MuxSoft/Burn
+	Format      engine.SubFormat // soft delivery format (the profile's preference)
+	SidecarPath string           // for SoftSidecar
+	Track       *probe.SubTrack  // for SoftExtract/MuxSoft/Burn
 	Reason      string
 }
 
-// Decide resolves the subtitle strategy. It never executes anything.
+// Decide resolves the subtitle strategy. It never executes anything. Soft
+// delivery requires the profile to accept a text format (SubFormats non-empty);
+// a device with no soft-subtitle path burns everything in.
 func Decide(req Request) (Decision, error) {
+	softFormat := req.Profile.SoftSubFormat()
+
 	if req.NoSubs {
 		return Decision{Kind: None, Reason: "--no-subs"}, nil
 	}
 
-	// An explicit sidecar/--sub always wins (text, served directly).
+	// An explicit sidecar/--sub always wins (text, converted to the profile's
+	// format and served directly).
 	if req.SidecarPath != "" {
-		return Decision{Kind: SoftSidecar, SidecarPath: req.SidecarPath, Reason: "sidecar/--sub provided"}, nil
+		if softFormat == engine.SubFormatNone {
+			return Decision{Kind: None, Reason: "this device has no soft-subtitle support; sidecar ignored"}, nil
+		}
+		return Decision{Kind: SoftSidecar, Format: softFormat, SidecarPath: req.SidecarPath, Reason: "sidecar/--sub provided"}, nil
 	}
 
 	var subsList []probe.SubTrack
@@ -83,17 +94,25 @@ func Decide(req Request) (Decision, error) {
 		if track.Kind != probe.SubText {
 			return Decision{}, fmt.Errorf("--soft requires a text subtitle track, but track %d is %s (%s)", track.SubIndex, track.Kind, track.Codec)
 		}
-		return Decision{Kind: SoftExtract, Track: track, Reason: "--soft on text track"}, nil
+		if softFormat == engine.SubFormatNone {
+			return Decision{}, fmt.Errorf("--soft: this device has no soft-subtitle support")
+		}
+		return Decision{Kind: SoftExtract, Format: softFormat, Track: track, Reason: "--soft on text track"}, nil
 	}
 	if req.ForceBurn {
 		return Decision{Kind: Burn, Track: track, Reason: "--burn"}, nil
 	}
 
-	// Auto: text -> soft. Bitmap -> burn by default (webOS does not demux embedded
-	// subs over DLNA, see plan 0.4); --mux-soft opts into the experimental soft path.
+	// Auto: text -> soft in the profile's format, but only when the device has a
+	// soft-subtitle path at all. Bitmap -> burn by default (no mainstream TV
+	// demuxes an embedded bitmap track from a cast stream); --mux-soft opts into
+	// the experimental soft path.
 	switch track.Kind {
 	case probe.SubText:
-		return Decision{Kind: SoftExtract, Track: track, Reason: fmt.Sprintf("embedded text track s:%d", track.SubIndex)}, nil
+		if softFormat == engine.SubFormatNone {
+			return Decision{Kind: Burn, Track: track, Reason: "device has no soft-subtitle path"}, nil
+		}
+		return Decision{Kind: SoftExtract, Format: softFormat, Track: track, Reason: fmt.Sprintf("embedded text track s:%d", track.SubIndex)}, nil
 	case probe.SubBitmap:
 		if req.MuxSoftTry {
 			return Decision{Kind: MuxSoft, Track: track, Reason: "--mux-soft on bitmap track (experimental)"}, nil

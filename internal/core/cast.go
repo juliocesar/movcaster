@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/juliocesar/movcaster/internal/config"
+	"github.com/juliocesar/movcaster/internal/engine"
 	"github.com/juliocesar/movcaster/internal/probe"
 	"github.com/juliocesar/movcaster/internal/renderer"
 	"github.com/juliocesar/movcaster/internal/subs"
@@ -509,7 +510,7 @@ func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir 
 	media.SubURL, media.SubMIME, media.SubType = "", "", ""
 
 	dec, derr := subs.Decide(subs.Request{
-		Info: info, SidecarPath: sub.Sidecar,
+		Info: info, Profile: defaultProfile, SidecarPath: sub.Sidecar,
 		NoSubs: sub.NoSubs, ForceBurn: sub.Burn, ForceSoft: sub.Soft,
 		MuxSoftTry: sub.MuxSoft, TrackIndex: sub.TrackIndex,
 	})
@@ -517,13 +518,13 @@ func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir 
 		return "", nil, nil, derr
 	}
 
-	// The codec plan has to be known *before* the subtitles are prepared: a
-	// transcoded stream is rebased to start at 0, so soft cue times must be
-	// rebased by the same ss to stay in step (direct-play keeps the file's own
-	// absolute timeline, so it stays at 0).
-	plan := codecPlan(info, forceTranscode)
+	// The codec/container plan has to be known *before* the subtitles are
+	// prepared: a transcoded (or remuxed) stream is rebased to start at 0, so
+	// soft cue times must be rebased by the same ss to stay in step (direct-play
+	// keeps the file's own absolute timeline, so it stays at 0).
+	plan := codecPlan(info, defaultProfile, forceTranscode)
 	subOffset := time.Duration(0)
-	if plan.Kind == TranscodeCodec {
+	if plan.Kind != TranscodeNone {
 		subOffset = ss
 	}
 
@@ -532,11 +533,16 @@ func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir 
 		return "", nil, nil, err
 	}
 
-	// Codec-compatibility fallback: only when subs didn't already force a transcode.
-	if build == nil && plan.Kind == TranscodeCodec {
-		build = func(s time.Duration) []string { return transcode.Args(abs, s, plan.Video, plan.Audio) }
+	// Codec/container fallback: only when subs didn't already force a transcode.
+	if build == nil && plan.Kind != TranscodeNone {
+		tplan := plan.plan()
+		build = func(s time.Duration) []string { return transcode.Args(abs, s, defaultProfile, tplan) }
 		if label == "" {
-			label = "transcode"
+			if plan.Kind == TranscodeRemux {
+				label = "remux"
+			} else {
+				label = "transcode"
+			}
 		}
 		applyTranscode(srv, media, build, ss)
 	}
@@ -555,11 +561,12 @@ func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir 
 // previous segment's caption URL.
 type softSubFn func(ctx context.Context, ss time.Duration, media *renderer.Media) error
 
-// serveSoft points the server + media at an SRT and refreshes the caption URL.
-func serveSoft(srv MediaServer, media *renderer.Media, srtPath string) {
-	mime, typ := subKind(srtPath)
-	srv.SetSubtitle(srtPath, mime)
-	media.SubURL, media.SubMIME, media.SubType = srv.SubURL(), mime, typ
+// serveSoft points the server + media at a soft-subtitle file and refreshes the
+// caption URL. The MIME/type follow the decision's format, not the extension.
+func serveSoft(srv MediaServer, media *renderer.Media, path string, format engine.SubFormat) {
+	mime := format.MIME()
+	srv.SetSubtitle(path, mime)
+	media.SubURL, media.SubMIME, media.SubType = srv.SubURL(), mime, format.String()
 }
 
 // clearSoft drops the caption reference (used when no cues remain after ss).
@@ -579,16 +586,16 @@ func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, 
 		return "", nil, nil, nil
 
 	case subs.SoftSidecar:
-		sidecar := dec.SidecarPath
+		sidecar, format := dec.SidecarPath, dec.Format
 		resoft = func(ctx context.Context, at time.Duration, m *renderer.Media) error {
-			shifted, err := subs.ShiftText(ctx, sidecar, at, tmpDir)
+			shifted, err := subs.ShiftText(ctx, sidecar, at, tmpDir, format)
 			if subs.NoCuesAfterOffset(err) {
 				clearSoft(m)
 				return nil
 			} else if err != nil {
 				return err
 			}
-			serveSoft(srv, m, shifted)
+			serveSoft(srv, m, shifted, format)
 			return nil
 		}
 		sctx, scancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -600,16 +607,16 @@ func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, 
 		return label, nil, resoft, nil
 
 	case subs.SoftExtract:
-		idx := dec.Track.SubIndex
+		idx, format := dec.Track.SubIndex, dec.Format
 		resoft = func(ctx context.Context, at time.Duration, m *renderer.Media) error {
-			srt, err := subs.ExtractText(ctx, abs, idx, at, tmpDir)
+			extracted, err := subs.ExtractText(ctx, abs, idx, at, tmpDir, format)
 			if subs.NoCuesAfterOffset(err) {
 				clearSoft(m)
 				return nil
 			} else if err != nil {
 				return err
 			}
-			serveSoft(srv, m, srt)
+			serveSoft(srv, m, extracted, format)
 			return nil
 		}
 		ectx, ecancel := context.WithTimeout(context.Background(), 60*time.Second)

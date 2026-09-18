@@ -318,16 +318,6 @@ func mimeForExt(path string) string {
 	}
 }
 
-// subKind returns the (HTTP/protocolInfo mime, sec:type) for a subtitle file.
-func subKind(path string) (mime, secType string) {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".vtt":
-		return "text/vtt", "vtt"
-	default:
-		return "text/srt", "srt"
-	}
-}
-
 // resumeOffset decides where to resume a file: the saved position, unless it is
 // negligible (<5s) or within 30s of the known end (treat as finished -> start over).
 func resumeOffset(saved, knownDur time.Duration) time.Duration {

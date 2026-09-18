@@ -8,10 +8,32 @@ import (
 	"strings"
 	"time"
 
+	"github.com/juliocesar/movcaster/internal/engine"
 	"github.com/juliocesar/movcaster/internal/probe"
 	"github.com/juliocesar/movcaster/internal/subs"
 	"github.com/juliocesar/movcaster/internal/transcode"
 )
+
+// defaultProfile is what planning uses when no device is known (--info without
+// -t). It matches the LG webOS renderer this tool grew up against; the DLNA
+// engine ships the same values as its default.
+var defaultProfile = engine.Profile{
+	VideoCodecs:        codecSet("h264", "hevc", "mpeg4", "mpeg2video", "vc1", "msmpeg4v3"),
+	AudioCodecs:        codecSet("aac", "ac3", "eac3", "mp3", "mp2", "dts", "flac"),
+	SubFormats:         []engine.SubFormat{engine.SubFormatSRT},
+	LoadStartsPlayback: true,
+	TranscodeVideo:     "libx264",
+	TranscodeAudio:     "aac",
+	TranscodeContainer: "mp4",
+}
+
+func codecSet(names ...string) map[string]bool {
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
 
 // SubtitleOptions are the subtitle-related inputs to a cast.
 type SubtitleOptions struct {
@@ -41,6 +63,8 @@ const (
 	TranscodeBurn
 	// TranscodeCodec re-encodes for codec compatibility.
 	TranscodeCodec
+	// TranscodeRemux changes only the container; both streams are copied.
+	TranscodeRemux
 )
 
 // TranscodePlan summarizes the transcode decision (filled by Start; Prepare
@@ -49,6 +73,7 @@ type TranscodePlan struct {
 	Kind  TranscodeKind
 	Video bool // codec: re-encode video
 	Audio bool // codec: re-encode audio
+	Remux bool // container mismatch (streams may still be copied)
 }
 
 // Preparation is the result of planning a cast: probe + subtitle strategy. It
@@ -87,10 +112,11 @@ func (a *App) Prepare(ctx context.Context, req CastRequest) (*Preparation, error
 		p.Info = info
 	}
 
-	p.Codec = codecPlan(p.Info, req.ForceTranscode)
+	p.Codec = codecPlan(p.Info, defaultProfile, req.ForceTranscode)
 
 	dec, derr := subs.Decide(subs.Request{
 		Info:        p.Info,
+		Profile:     defaultProfile,
 		SidecarPath: p.Sidecar,
 		NoSubs:      req.Subtitle.NoSubs,
 		ForceBurn:   req.Subtitle.Burn,
@@ -163,31 +189,45 @@ func (p *Preparation) DescribeStrategy() string {
 	return fmt.Sprintf("  -> strategy: %s  (%s)\n", p.Strategy.Kind, p.Strategy.Reason)
 }
 
-// DescribeCodec renders the codec-compatibility line `--info` prints, or "" when
-// the file direct-plays. A burn-in strategy transcodes anyway, so the streams
-// listed here are the ones that would be re-encoded on top of the burn.
+// DescribeCodec renders the codec/container-compatibility line `--info` prints,
+// or "" when the file direct-plays. A burn-in strategy transcodes anyway, so the
+// streams listed here are the ones that would be re-encoded on top of the burn.
 func (p *Preparation) DescribeCodec() string {
-	if p.Codec.Kind != TranscodeCodec {
+	switch p.Codec.Kind {
+	case TranscodeCodec:
+		var what []string
+		if p.Codec.Video {
+			what = append(what, "video "+p.Info.VideoCodec)
+		}
+		if p.Codec.Audio {
+			what = append(what, "audio "+p.Info.AudioCodec)
+		}
+		return fmt.Sprintf("  -> transcode: %s not supported by the renderer\n", strings.Join(what, " + "))
+	case TranscodeRemux:
+		return fmt.Sprintf("  -> remux: container %s not supported by the renderer (streams copied)\n", p.Info.Container)
+	default:
 		return ""
 	}
-	var what []string
-	if p.Codec.Video {
-		what = append(what, "video "+p.Info.VideoCodec)
-	}
-	if p.Codec.Audio {
-		what = append(what, "audio "+p.Info.AudioCodec)
-	}
-	return fmt.Sprintf("  -> transcode: %s not supported by the renderer\n", strings.Join(what, " + "))
 }
 
-// codecPlan computes the codec-compatibility transcode need (no subs involved).
-func codecPlan(info *probe.MediaInfo, force bool) TranscodePlan {
-	needV, needA := transcode.Needs(info)
+// codecPlan computes the codec/container-compatibility transcode need for a
+// profile (no subs involved).
+func codecPlan(info *probe.MediaInfo, prof engine.Profile, force bool) TranscodePlan {
+	plan := transcode.Needs(info, prof)
 	if force {
-		needV, needA = true, true
+		plan.Video, plan.Audio = true, true
 	}
-	if needV || needA {
-		return TranscodePlan{Kind: TranscodeCodec, Video: needV, Audio: needA}
+	switch {
+	case plan.Video || plan.Audio:
+		return TranscodePlan{Kind: TranscodeCodec, Video: plan.Video, Audio: plan.Audio, Remux: plan.Remux}
+	case plan.Remux:
+		return TranscodePlan{Kind: TranscodeRemux, Remux: true}
+	default:
+		return TranscodePlan{Kind: TranscodeNone}
 	}
-	return TranscodePlan{Kind: TranscodeNone}
+}
+
+// plan converts back to the transcode package's shape for Args.
+func (p TranscodePlan) plan() transcode.Plan {
+	return transcode.Plan{Video: p.Video, Audio: p.Audio, Remux: p.Remux}
 }

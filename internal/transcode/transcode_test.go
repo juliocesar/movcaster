@@ -5,29 +5,70 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juliocesar/movcaster/internal/engine"
 	"github.com/juliocesar/movcaster/internal/probe"
 )
 
+func set(names ...string) map[string]bool {
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+// webOS is the LG profile: no container restriction, broad codec support.
+var webOS = engine.Profile{
+	VideoCodecs: set("h264", "hevc", "mpeg4", "mpeg2video", "vc1", "msmpeg4v3"),
+	AudioCodecs: set("aac", "ac3", "eac3", "mp3", "mp2", "dts", "flac"),
+}
+
+// cast is the conservative Default Media Receiver profile.
+var cast = engine.Profile{
+	Containers:  set("mp4", "webm"),
+	VideoCodecs: set("h264", "vp8", "vp9"),
+	AudioCodecs: set("aac", "mp3", "opus", "vorbis", "flac"),
+}
+
 func TestNeeds(t *testing.T) {
 	cases := []struct {
-		video, audio string
-		wantV, wantA bool
+		name      string
+		info      probe.MediaInfo
+		p         engine.Profile
+		wantV     bool
+		wantA     bool
+		wantRemux bool
 	}{
-		{"h264", "aac", false, false},
-		{"hevc", "eac3", false, false},
-		{"av1", "eac3", true, false},  // AV1 WEB-DLs: video only
-		{"h264", "opus", false, true}, // audio only
-		{"vp9", "truehd", true, true}, // both
-		{"", "", false, false},        // probe found nothing
+		{"webos direct-play", probe.MediaInfo{Container: "matroska", VideoCodec: "h264", AudioCodec: "eac3"}, webOS, false, false, false},
+		{"webos av1 video only", probe.MediaInfo{Container: "matroska", VideoCodec: "av1", AudioCodec: "eac3"}, webOS, true, false, false},
+		{"webos opus audio only", probe.MediaInfo{Container: "matroska", VideoCodec: "h264", AudioCodec: "opus"}, webOS, false, true, false},
+		{"webos both", probe.MediaInfo{VideoCodec: "vp9", AudioCodec: "truehd"}, webOS, true, true, false},
+		{"cast mp4 direct-play", probe.MediaInfo{Container: "mp4", VideoCodec: "h264", AudioCodec: "aac"}, cast, false, false, false},
+		{"cast mkv remux only", probe.MediaInfo{Container: "matroska", VideoCodec: "h264", AudioCodec: "aac"}, cast, false, false, true},
+		{"cast mkv eac3 remux+audio", probe.MediaInfo{Container: "matroska", VideoCodec: "h264", AudioCodec: "eac3"}, cast, false, true, true},
+		{"cast av1 opus full", probe.MediaInfo{Container: "matroska", VideoCodec: "av1", AudioCodec: "opus"}, cast, true, false, true},
+		{"empty probe", probe.MediaInfo{}, cast, false, false, false},
 	}
 	for _, c := range cases {
-		v, a := Needs(&probe.MediaInfo{VideoCodec: c.video, AudioCodec: c.audio})
-		if v != c.wantV || a != c.wantA {
-			t.Errorf("Needs(%s/%s) = (%v,%v), want (%v,%v)", c.video, c.audio, v, a, c.wantV, c.wantA)
+		got := Needs(&c.info, c.p)
+		if got.Video != c.wantV || got.Audio != c.wantA || got.Remux != c.wantRemux {
+			t.Errorf("%s: Needs = %+v, want video=%v audio=%v remux=%v", c.name, got, c.wantV, c.wantA, c.wantRemux)
 		}
 	}
-	if v, a := Needs(nil); v || a {
-		t.Errorf("Needs(nil) = (%v,%v), want (false,false)", v, a)
+	if got := Needs(nil, cast); got.Needed() {
+		t.Errorf("Needs(nil) = %+v, want nothing", got)
+	}
+}
+
+func TestNeedsLimits(t *testing.T) {
+	p := engine.Profile{MaxVideoHeight: 1080, MaxAudioChannels: 2}
+	got := Needs(&probe.MediaInfo{VideoCodec: "h264", Height: 2160, AudioCodec: "aac", AudioChannels: 6}, p)
+	if !got.Video || !got.Audio {
+		t.Fatalf("4K 5.1 over 1080p stereo limits must re-encode both, got %+v", got)
+	}
+	got = Needs(&probe.MediaInfo{VideoCodec: "h264", Height: 1080, AudioCodec: "aac", AudioChannels: 2}, p)
+	if got.Needed() {
+		t.Fatalf("within limits must direct-play, got %+v", got)
 	}
 }
 
@@ -35,12 +76,10 @@ func TestNeeds(t *testing.T) {
 // until it has parsed a packet, so a bare empty_moov aborts ffmpeg before any
 // bytes reach the TV. delay_moov must be present on every invocation.
 func TestArgsAlwaysDelaysMoov(t *testing.T) {
-	for _, tv := range []bool{true, false} {
-		for _, ta := range []bool{true, false} {
-			args := strings.Join(Args("in.mkv", 0, tv, ta), " ")
-			if !strings.Contains(args, "+delay_moov") {
-				t.Errorf("Args(video=%v audio=%v) missing +delay_moov: %s", tv, ta, args)
-			}
+	for _, plan := range []Plan{{}, {Video: true}, {Audio: true}, {Video: true, Audio: true}, {Remux: true}} {
+		args := strings.Join(Args("in.mkv", 0, webOS, plan), " ")
+		if !strings.Contains(args, "+delay_moov") {
+			t.Errorf("Args(%+v) missing +delay_moov: %s", plan, args)
 		}
 	}
 }
@@ -48,38 +87,56 @@ func TestArgsAlwaysDelaysMoov(t *testing.T) {
 // delay_moov makes ffmpeg emit edit lists, which webOS mishandles (video freezes
 // on resume from pause while audio keeps playing), so they must stay suppressed.
 func TestArgsSuppressesEditLists(t *testing.T) {
-	for _, tv := range []bool{true, false} {
-		for _, ta := range []bool{true, false} {
-			args := Args("in.mkv", 0, tv, ta)
-			var found bool
-			for i, a := range args {
-				if a == "-use_editlist" && i+1 < len(args) && args[i+1] == "0" {
-					found = true
-				}
+	for _, plan := range []Plan{{}, {Video: true}, {Audio: true}, {Video: true, Audio: true}, {Remux: true}} {
+		args := Args("in.mkv", 0, webOS, plan)
+		var found bool
+		for i, a := range args {
+			if a == "-use_editlist" && i+1 < len(args) && args[i+1] == "0" {
+				found = true
 			}
-			if !found {
-				t.Errorf("Args(video=%v audio=%v) missing -use_editlist 0: %s", tv, ta, strings.Join(args, " "))
-			}
+		}
+		if !found {
+			t.Errorf("Args(%+v) missing -use_editlist 0: %s", plan, strings.Join(args, " "))
 		}
 	}
 }
 
 func TestArgsCodecSelection(t *testing.T) {
-	got := strings.Join(Args("in.mkv", 0, true, false), " ")
+	got := strings.Join(Args("in.mkv", 0, webOS, Plan{Video: true}), " ")
 	if !strings.Contains(got, "-c:v libx264") || !strings.Contains(got, "-c:a copy") {
 		t.Errorf("video-only transcode: %s", got)
 	}
-	got = strings.Join(Args("in.mkv", 0, false, true), " ")
+	got = strings.Join(Args("in.mkv", 0, webOS, Plan{Audio: true}), " ")
 	if !strings.Contains(got, "-c:v copy") || !strings.Contains(got, "-c:a aac") {
 		t.Errorf("audio-only transcode: %s", got)
+	}
+	// The targets come from the profile, not hardcoded strings.
+	p := webOS
+	p.TranscodeVideo, p.TranscodeAudio = "libx265", "libopus"
+	got = strings.Join(Args("in.mkv", 0, p, Plan{Video: true, Audio: true}), " ")
+	if !strings.Contains(got, "-c:v libx265") || !strings.Contains(got, "-c:a libopus") {
+		t.Errorf("profile targets ignored: %s", got)
+	}
+}
+
+// A remux-only plan must copy both streams: paying an encode for a container
+// change would be absurd.
+func TestArgsRemuxCopiesBothStreams(t *testing.T) {
+	got := strings.Join(Args("in.mkv", 0, cast, Plan{Remux: true}), " ")
+	if !strings.Contains(got, "-c:v copy") || !strings.Contains(got, "-c:a copy") {
+		t.Errorf("remux must copy both streams: %s", got)
+	}
+	if !strings.Contains(got, "-f mp4 pipe:1") {
+		t.Errorf("remux must retarget the container: %s", got)
 	}
 }
 
 func TestArgsSeekOffset(t *testing.T) {
-	if got := strings.Join(Args("in.mkv", 0, true, true), " "); strings.Contains(got, "-ss") {
+	full := Plan{Video: true, Audio: true}
+	if got := strings.Join(Args("in.mkv", 0, webOS, full), " "); strings.Contains(got, "-ss") {
 		t.Errorf("ss=0 should not emit -ss: %s", got)
 	}
-	got := Args("in.mkv", 90*time.Second, true, true)
+	got := Args("in.mkv", 90*time.Second, webOS, full)
 	joined := strings.Join(got, " ")
 	if !strings.Contains(joined, "-ss 90.000") {
 		t.Errorf("want -ss 90.000, got %s", joined)

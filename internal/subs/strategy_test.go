@@ -3,8 +3,12 @@ package subs
 import (
 	"testing"
 
+	"github.com/juliocesar/movcaster/internal/engine"
 	"github.com/juliocesar/movcaster/internal/probe"
 )
+
+// srtProfile accepts SRT soft subs, like the webOS profile.
+var srtProfile = engine.Profile{SubFormats: []engine.SubFormat{engine.SubFormatSRT}}
 
 func info(tracks ...probe.SubTrack) *probe.MediaInfo {
 	return &probe.MediaInfo{Subtitles: tracks}
@@ -71,6 +75,7 @@ func TestDecide(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			tc.req.Profile = srtProfile
 			got, err := Decide(tc.req)
 			if err != nil {
 				t.Fatalf("Decide error: %v", err)
@@ -78,19 +83,49 @@ func TestDecide(t *testing.T) {
 			if got.Kind != tc.want {
 				t.Errorf("Decide() = %v, want %v (reason: %s)", got.Kind, tc.want, got.Reason)
 			}
+			if got.Kind == SoftSidecar || got.Kind == SoftExtract {
+				if got.Format != engine.SubFormatSRT {
+					t.Errorf("soft decision must carry the profile's format, got %v", got.Format)
+				}
+			}
 		})
 	}
 }
 
+// A device whose profile lists no soft-subtitle format burns text tracks in and
+// drops sidecars: there is no soft path to deliver them over.
+func TestDecideNoSoftPath(t *testing.T) {
+	got, err := Decide(Request{Info: info(text(0)), TrackIndex: -1})
+	if err != nil || got.Kind != Burn {
+		t.Fatalf("text track without a soft path must burn, got %v err=%v", got.Kind, err)
+	}
+	got, err = Decide(Request{SidecarPath: "/x.srt", Info: info(), TrackIndex: -1})
+	if err != nil || got.Kind != None {
+		t.Fatalf("sidecar without a soft path must fall to none, got %v err=%v", got.Kind, err)
+	}
+	if _, err := Decide(Request{Info: info(text(0)), ForceSoft: true, TrackIndex: -1}); err == nil {
+		t.Fatal("--soft without a soft path must error")
+	}
+}
+
+// A VTT-first profile (Cast) flows its format into the decision.
+func TestDecideProfileFormat(t *testing.T) {
+	vtt := engine.Profile{SubFormats: []engine.SubFormat{engine.SubFormatVTT}}
+	got, err := Decide(Request{Info: info(text(0)), Profile: vtt, TrackIndex: -1})
+	if err != nil || got.Kind != SoftExtract || got.Format != engine.SubFormatVTT {
+		t.Fatalf("got kind=%v format=%v err=%v, want SoftExtract/VTT", got.Kind, got.Format, err)
+	}
+}
+
 func TestDecideForceSoftOnBitmapErrors(t *testing.T) {
-	_, err := Decide(Request{Info: info(bitmap(0)), ForceSoft: true, TrackIndex: -1})
+	_, err := Decide(Request{Info: info(bitmap(0)), Profile: srtProfile, ForceSoft: true, TrackIndex: -1})
 	if err == nil {
 		t.Fatal("expected error forcing soft on a bitmap track")
 	}
 }
 
 func TestDecideMissingExplicitTrack(t *testing.T) {
-	_, err := Decide(Request{Info: info(text(0)), TrackIndex: 9})
+	_, err := Decide(Request{Info: info(text(0)), Profile: srtProfile, TrackIndex: 9})
 	if err == nil {
 		t.Fatal("expected error for out-of-range --sub-track")
 	}

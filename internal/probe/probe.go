@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -47,16 +48,21 @@ type SubTrack struct {
 
 // MediaInfo summarizes a probed file.
 type MediaInfo struct {
-	Duration   time.Duration
-	VideoCodec string
-	AudioCodec string
-	Subtitles  []SubTrack
+	Duration      time.Duration
+	Container     string // normalized format name ("mp4", "matroska", "webm", ...)
+	VideoCodec    string
+	AudioCodec    string
+	Height        int // video height in pixels, 0 if unknown
+	AudioChannels int // first audio stream's channel count, 0 if unknown
+	Subtitles     []SubTrack
 }
 
 type ffStream struct {
 	Index       int               `json:"index"`
 	CodecName   string            `json:"codec_name"`
 	CodecType   string            `json:"codec_type"`
+	Height      int               `json:"height"`
+	Channels    int               `json:"channels"`
 	Tags        map[string]string `json:"tags"`
 	Disposition map[string]int    `json:"disposition"`
 }
@@ -64,7 +70,8 @@ type ffStream struct {
 type ffOutput struct {
 	Streams []ffStream `json:"streams"`
 	Format  struct {
-		Duration string `json:"duration"`
+		Duration   string `json:"duration"`
+		FormatName string `json:"format_name"`
 	} `json:"format"`
 }
 
@@ -97,6 +104,7 @@ func Probe(ctx context.Context, path string) (*MediaInfo, error) {
 	if d, err := strconv.ParseFloat(ff.Format.Duration, 64); err == nil {
 		mi.Duration = time.Duration(d * float64(time.Second))
 	}
+	mi.Container = normalizeContainer(ff.Format.FormatName, path)
 
 	subSeq := 0
 	for _, s := range ff.Streams {
@@ -108,10 +116,12 @@ func Probe(ctx context.Context, path string) (*MediaInfo, error) {
 			}
 			if mi.VideoCodec == "" {
 				mi.VideoCodec = s.CodecName
+				mi.Height = s.Height
 			}
 		case "audio":
 			if mi.AudioCodec == "" {
 				mi.AudioCodec = s.CodecName
+				mi.AudioChannels = s.Channels
 			}
 		case "subtitle":
 			t := SubTrack{
@@ -140,6 +150,28 @@ func classify(codec string) SubKind {
 	default:
 		return SubUnknown
 	}
+}
+
+// normalizeContainer maps ffprobe's format_name (a comma list of demuxer names)
+// to the single container name a Profile declares. The mp4 demuxer covers the
+// whole QuickTime family; matroska and webm share a demuxer, so the extension
+// disambiguates them (a Profile may accept webm but not matroska).
+func normalizeContainer(formatName, path string) string {
+	switch formatName {
+	case "":
+		return ""
+	case "mov,mp4,m4a,3gp,3g2,mj2":
+		return "mp4"
+	case "matroska,webm":
+		if strings.EqualFold(filepath.Ext(path), ".webm") {
+			return "webm"
+		}
+		return "matroska"
+	}
+	if i := strings.IndexByte(formatName, ','); i >= 0 {
+		return formatName[:i]
+	}
+	return formatName
 }
 
 // HasVideo reports whether a usable video stream was found.
