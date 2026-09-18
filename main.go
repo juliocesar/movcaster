@@ -40,6 +40,7 @@ func main() {
 		muxSoft    = flag.Bool("mux-soft", false, "remux a bitmap track as soft instead of burning (experimental; toggle on TV)")
 		tcode      = flag.Bool("transcode", false, "force a codec-compatibility transcode")
 		info       = flag.Bool("info", false, "probe the file, print streams and the subtitle decision, then exit")
+		probeDev   = flag.Bool("probe-device", false, "cast small test clips at the device and report what it actually plays")
 		noNext     = flag.Bool("no-next", false, "do not auto-play the next episode in the directory when one ends")
 		plist      = flag.String("playlist", "", "cast a playlist file (one video path per line; # comments allowed)")
 		resumeLast = flag.Bool("resume", false, "continue the last played video (no file argument)")
@@ -65,6 +66,15 @@ func main() {
 
 	if *list {
 		fail(runList(app, *engineName))
+		return
+	}
+
+	if *probeDev {
+		if len(flag.Args()) != 0 {
+			fmt.Fprintln(os.Stderr, "movcaster: --probe-device takes no file argument")
+			os.Exit(2)
+		}
+		fail(runProbeDevice(app, *target, *engineName))
 		return
 	}
 
@@ -174,6 +184,7 @@ Usage:
   movcaster <file> -t TARGET         target a device (IP, IP:port, engine:host, or device URL)
   movcaster <file> --engine NAME     restrict to one engine (dlna, googlecast)
   movcaster <file> --info            show streams + chosen subtitle strategy
+  movcaster --probe-device [-t T]    measure what the device actually plays
   movcaster <file> --sub foo.srt     force an explicit soft subtitle
   movcaster <file> --sub-track N     pick embedded subtitle track N (see --info)
   movcaster <file> --burn            burn the selected subtitle into the video
@@ -254,7 +265,7 @@ func runInfo(app *core.App, req core.CastRequest) error {
 		if derr != nil {
 			return derr
 		}
-		prep, err = app.PrepareWithProfile(ctx, req, dev.Profile(), dev.Engine())
+		prep, err = app.PrepareWithProfile(ctx, req, app.DeviceProfile(dev), dev.Engine())
 	} else {
 		prep, err = app.Prepare(ctx, req)
 	}
@@ -271,6 +282,25 @@ func runInfo(app *core.App, req core.CastRequest) error {
 	fmt.Print(prep.DescribeProfile())
 	fmt.Print(prep.DescribeStrategy())
 	fmt.Print(prep.DescribeCodec())
+	return nil
+}
+
+// runProbeDevice casts generated test clips at the device and prints the
+// empirically derived profile override, ready to paste into the config.
+func runProbeDevice(app *core.App, target, engine string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	rep, err := app.ProbeDevice(ctx, target, engine)
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Println(rep.MarshalReport())
+	fmt.Println()
+	fmt.Println("Paste profile_override under device_profiles[\"" + rep.Key + "\"] in the config to apply it.")
+	fmt.Println("Caveat: a 4-second test clip proving a codec decodes does not prove a two-hour")
+	fmt.Println("4K file streams, and passthrough audio can differ between a test tone and a")
+	fmt.Println("real track. Verify with one real file.")
 	return nil
 }
 

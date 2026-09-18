@@ -379,7 +379,7 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 	// Remember this device so a future bare `movcaster <file>` finds it again.
 	_ = a.store.Save(config.Config{LastDeviceHost: dev.Host(), LastDeviceEngine: dev.Engine()})
 
-	prof := dev.Profile()
+	prof := a.DeviceProfile(dev)
 	prep, err := a.PrepareWithProfile(ctx, req, prof, dev.Engine())
 	if err != nil {
 		return nil, nil, err

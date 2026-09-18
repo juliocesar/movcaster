@@ -15,6 +15,20 @@ type Config struct {
 	// config, or pre-engine state) means "try every engine against that host",
 	// which is exactly what the single-engine behavior was.
 	LastDeviceEngine string `json:"last_device_engine,omitempty"`
+	// DeviceProfiles overrides an engine's default capability profile per
+	// device, keyed by "engine:host" (e.g. "googlecast:192.168.1.20"). Filled by
+	// hand or pasted from `movcaster --probe-device` output.
+	DeviceProfiles map[string]ProfileOverride `json:"device_profiles,omitempty"`
+}
+
+// ProfileOverride widens (or narrows) an engine's default profile for one
+// device. A nil/empty list keeps the engine default for that axis.
+type ProfileOverride struct {
+	Containers       []string `json:"containers,omitempty"`
+	VideoCodecs      []string `json:"video_codecs,omitempty"`
+	AudioCodecs      []string `json:"audio_codecs,omitempty"`
+	MaxVideoHeight   int      `json:"max_video_height,omitempty"`
+	MaxAudioChannels int      `json:"max_audio_channels,omitempty"`
 }
 
 func path() (string, error) {
