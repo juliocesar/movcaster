@@ -5,8 +5,10 @@ package all
 import (
 	"github.com/juliocesar/movcaster/internal/engine"
 	"github.com/juliocesar/movcaster/internal/engine/dlna"
+	"github.com/juliocesar/movcaster/internal/engine/googlecast"
 )
 
 func init() {
 	engine.Register(dlna.New())
+	engine.Register(googlecast.New())
 }
