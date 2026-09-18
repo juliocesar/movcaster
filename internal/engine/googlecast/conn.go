@@ -59,13 +59,14 @@ func dial(ctx context.Context, addr string) (*conn, error) {
 	if _, _, err := net.SplitHostPort(addr); err != nil {
 		addr = net.JoinHostPort(addr, castPort)
 	}
-	d := &net.Dialer{Timeout: 5 * time.Second}
 	// The receiver presents a self-signed device certificate. This is a LAN
 	// device with no meaningful identity a CA could vouch for; refusing it would
 	// make casting impossible. Do not "fix" this by enabling verification.
-	tc, err := tls.DialWithDialer(d, "tcp", addr, &tls.Config{
-		InsecureSkipVerify: true,
-	})
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 5 * time.Second},
+		Config:    &tls.Config{InsecureSkipVerify: true},
+	}
+	tc, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -78,11 +79,6 @@ func dial(ctx context.Context, addr string) (*conn, error) {
 	}
 	go c.readLoop()
 	go c.heartbeat()
-	// Respect ctx cancellation during the caller's setup phase.
-	if err := ctx.Err(); err != nil {
-		c.close(err)
-		return nil, err
-	}
 	return c, nil
 }
 
