@@ -62,6 +62,24 @@ type SubtitleController interface {
 	SubInfo() string
 }
 
+// AudioController is the optional capability of live audio track switching,
+// implemented by *core.Cast. Like SubtitleController it stays off Controller; the
+// audio picker opens only for controllers that implement it, with 2+ tracks.
+type AudioController interface {
+	AudioChoices() []string
+	ActiveAudio() int
+	SetAudio(ctx context.Context, idx int) error
+	AudioInfo() string
+}
+
+// pickerKind is what the shared track picker is choosing.
+type pickerKind int
+
+const (
+	pickSubs pickerKind = iota
+	pickAudio
+)
+
 const seekDebounce = time.Second
 
 type tickMsg time.Time
@@ -90,14 +108,15 @@ type spinMsg time.Time
 type seekFireMsg struct{ gen int }
 type seekDoneMsg struct{ err error }
 
-// subDoneMsg reports the result of a live subtitle switch.
-type subDoneMsg struct{ err error }
+// switchDoneMsg reports the result of a live subtitle or audio switch.
+type switchDoneMsg struct{ err error }
 
 type model struct {
-	ctrl    Controller
-	title   string
-	device  string
-	subInfo string
+	ctrl      Controller
+	title     string
+	device    string
+	subInfo   string
+	audioInfo string // live audio track label; "" for single-track files
 
 	pos, dur   time.Duration
 	state      string
@@ -125,14 +144,16 @@ type model struct {
 	pendingSeek time.Duration
 	seekGen     int
 
-	// Live subtitle picker. subMenuOpen shows the overlay; switching gates polling
-	// during the restart (like seeking) so transient transport states aren't
-	// sampled mid-switch.
-	subMenuOpen bool
-	subChoices  []string
-	subCursor   int
-	subScroll   int // index of the first visible picker row (releases with 40+ tracks overflow)
+	// Live track picker (subtitles or audio, per menuKind). menuOpen shows the
+	// overlay; switching gates polling during the restart (like seeking) so
+	// transient transport states aren't sampled mid-switch.
+	menuOpen    bool
+	menuKind    pickerKind
+	menuChoices []string
+	menuCursor  int
+	menuScroll  int // index of the first visible picker row (releases with 40+ tracks overflow)
 	switching   bool
+	switchKind  pickerKind // what the in-flight switch changes, for the status line
 
 	// Connecting phase (Start): ctrl is nil until readyMsg adopts it, so every
 	// command that touches the controller is gated on !connecting. statusLines
@@ -151,6 +172,7 @@ type Options struct {
 	Title     string
 	Device    string
 	SubInfo   string // e.g. "soft: file.srt" or "burn-in" (shown in header)
+	AudioInfo string // live audio track label, "" for single-track files (shown in header)
 	HasVolume bool
 }
 
@@ -158,15 +180,16 @@ type Options struct {
 // then returns why it ended so the caller can decide whether to advance.
 func Run(ctrl Controller, opts Options) (Outcome, error) {
 	m := model{
-		ctrl:    ctrl,
-		title:   opts.Title,
-		device:  opts.Device,
-		subInfo: opts.SubInfo,
-		hasVol:  opts.HasVolume,
-		state:   "...",
-		width:   60,
-		height:  24,
-		prog:    progress.New(progress.WithDefaultGradient(), progress.WithWidth(50)),
+		ctrl:      ctrl,
+		title:     opts.Title,
+		device:    opts.Device,
+		subInfo:   opts.SubInfo,
+		audioInfo: opts.AudioInfo,
+		hasVol:    opts.HasVolume,
+		state:     "...",
+		width:     60,
+		height:    24,
+		prog:      progress.New(progress.WithDefaultGradient(), progress.WithWidth(50)),
 	}
 	p := tea.NewProgram(m)
 	final, err := p.Run()
@@ -314,8 +337,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.prog.Width = w
 		}
 		// A resize can leave the cursor outside the (now differently sized) window.
-		if m.subMenuOpen {
-			m.subScroll = scrollFor(m.subCursor, m.subScroll, m.subVisibleRows(), len(m.subChoices))
+		if m.menuOpen {
+			m.menuScroll = scrollFor(m.menuCursor, m.menuScroll, m.menuVisibleRows(), len(m.menuChoices))
 		}
 		return m, nil
 
@@ -344,6 +367,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.title = msg.opts.Title
 		m.device = msg.opts.Device
 		m.subInfo = msg.opts.SubInfo
+		m.audioInfo = msg.opts.AudioInfo
 		m.hasVol = msg.opts.HasVolume
 		m.connecting = false
 		if m.quitting {
@@ -407,12 +431,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case subDoneMsg:
+	case switchDoneMsg:
 		m.switching = false
 		if msg.err != nil {
 			m.lastErr = msg.err
-		} else if sc, ok := m.ctrl.(SubtitleController); ok {
-			m.subInfo = sc.SubInfo() // header label reflects the new track
+			return m, nil
+		}
+		// Header labels reflect the new delivery (either switch can change both:
+		// a subtitle switch may flip direct play to a burn-in, and so on).
+		if sc, ok := m.ctrl.(SubtitleController); ok {
+			m.subInfo = sc.SubInfo()
+		}
+		if ac, ok := m.ctrl.(AudioController); ok {
+			m.audioInfo = ac.AudioInfo()
 		}
 		return m, nil
 
@@ -454,9 +485,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// While the subtitle picker is open it owns the keyboard.
-	if m.subMenuOpen {
-		return m.handleSubMenuKey(msg)
+	// While a picker is open it owns the keyboard.
+	if m.menuOpen {
+		return m.handleMenuKey(msg)
 	}
 
 	switch msg.String() {
@@ -469,14 +500,17 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		// Open the subtitle picker if this controller supports switching.
 		if sc, ok := m.ctrl.(SubtitleController); ok {
-			m.subChoices = sc.SubtitleChoices()
-			if len(m.subChoices) > 0 {
-				m.subCursor = sc.ActiveSubtitle()
-				// Open centred on the active track: with a 40-track release it would
-				// otherwise be scrolled off-screen.
-				vis := m.subVisibleRows()
-				m.subScroll = scrollFor(m.subCursor, m.subCursor-vis/2, vis, len(m.subChoices))
-				m.subMenuOpen = true
+			if choices := sc.SubtitleChoices(); len(choices) > 0 {
+				m.openMenu(pickSubs, choices, sc.ActiveSubtitle())
+			}
+		}
+		return m, nil
+
+	case "a":
+		// Open the audio picker when there is more than one track to choose from.
+		if ac, ok := m.ctrl.(AudioController); ok {
+			if choices := ac.AudioChoices(); len(choices) > 1 {
+				m.openMenu(pickAudio, choices, ac.ActiveAudio())
 			}
 		}
 		return m, nil
@@ -534,53 +568,87 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleSubMenuKey handles keystrokes while the subtitle picker is open. Up/Down
-// (k/j) move the cursor one row, PgUp/PgDn (ctrl+u/ctrl+d) a screenful, Home/End
-// (g/G) jump to the ends, Enter applies the highlighted choice (kicking off the
-// switch), Esc/s close without changing anything, and q/ctrl+c still quit. The
-// visible window follows the cursor — a release can carry 40+ subtitle tracks,
-// which does not fit on screen.
-func (m model) handleSubMenuKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	last := len(m.subChoices) - 1
-	page := m.subVisibleRows()
+// openMenu shows the picker for kind, centred on the active choice: with a
+// 40-track release it would otherwise be scrolled off-screen.
+func (m *model) openMenu(kind pickerKind, choices []string, active int) {
+	m.menuKind = kind
+	m.menuChoices = choices
+	m.menuCursor = clamp(active, 0, len(choices)-1)
+	vis := m.menuVisibleRows()
+	m.menuScroll = scrollFor(m.menuCursor, m.menuCursor-vis/2, vis, len(choices))
+	m.menuOpen = true
+}
+
+// menuKey is the key that opened (and so also closes) the current picker.
+func (m model) menuKey() string {
+	if m.menuKind == pickAudio {
+		return "a"
+	}
+	return "s"
+}
+
+// applyChoice returns the switch call for the highlighted picker row, or nil if
+// the controller lacks the capability.
+func (m model) applyChoice(idx int) func(context.Context) error {
+	switch m.menuKind {
+	case pickAudio:
+		if ac, ok := m.ctrl.(AudioController); ok {
+			return func(ctx context.Context) error { return ac.SetAudio(ctx, idx) }
+		}
+	default:
+		if sc, ok := m.ctrl.(SubtitleController); ok {
+			return func(ctx context.Context) error { return sc.SetSubtitle(ctx, idx) }
+		}
+	}
+	return nil
+}
+
+// handleMenuKey handles keystrokes while a picker is open. Up/Down (k/j) move the
+// cursor one row, PgUp/PgDn (ctrl+u/ctrl+d) a screenful, Home/End (g/G) jump to
+// the ends, Enter applies the highlighted choice (kicking off the switch), Esc or
+// the picker's own key (s/a) close without changing anything, and q/ctrl+c still
+// quit. The visible window follows the cursor — a release can carry 40+ subtitle
+// tracks, which does not fit on screen.
+func (m model) handleMenuKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	last := len(m.menuChoices) - 1
+	page := m.menuVisibleRows()
 
 	switch msg.String() {
 	case "up", "k":
-		m.subCursor--
+		m.menuCursor--
 
 	case "down", "j":
-		m.subCursor++
+		m.menuCursor++
 
 	case "pgup", "ctrl+u":
-		m.subCursor -= page
+		m.menuCursor -= page
 
 	case "pgdown", "ctrl+d":
-		m.subCursor += page
+		m.menuCursor += page
 
 	case "home", "g":
-		m.subCursor = 0
+		m.menuCursor = 0
 
 	case "end", "G":
-		m.subCursor = last
+		m.menuCursor = last
 
-	case "esc", "s":
-		m.subMenuOpen = false
+	case "esc", m.menuKey():
+		m.menuOpen = false
 		return m, nil
 
 	case "enter":
-		sc, ok := m.ctrl.(SubtitleController)
-		if !ok {
-			m.subMenuOpen = false
+		m.menuOpen = false
+		apply := m.applyChoice(m.menuCursor)
+		if apply == nil {
 			return m, nil
 		}
-		idx := m.subCursor
-		m.subMenuOpen = false
 		m.switching = true
+		m.switchKind = m.menuKind
 		return m, func() tea.Msg {
 			// Generous budget: the switch does several retried SOAP calls.
 			ctx, cancel := withCtx(60 * time.Second)
 			defer cancel()
-			return subDoneMsg{err: sc.SetSubtitle(ctx, idx)}
+			return switchDoneMsg{err: apply(ctx)}
 		}
 
 	case "q", "ctrl+c":
@@ -593,14 +661,14 @@ func (m model) handleSubMenuKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// A movement key landed here: clamp the cursor, then scroll to follow it.
-	m.subCursor = clamp(m.subCursor, 0, last)
-	m.subScroll = scrollFor(m.subCursor, m.subScroll, page, len(m.subChoices))
+	m.menuCursor = clamp(m.menuCursor, 0, last)
+	m.menuScroll = scrollFor(m.menuCursor, m.menuScroll, page, len(m.menuChoices))
 	return m, nil
 }
 
-// subVisibleRows is how many picker rows fit on screen, leaving room for the
+// menuVisibleRows is how many picker rows fit on screen, leaving room for the
 // header/progress/status chrome above and the hint + scroll-indicator lines below.
-func (m model) subVisibleRows() int {
+func (m model) menuVisibleRows() int {
 	const chrome = 11
 	n := m.height - chrome
 	if n < 3 {
@@ -657,6 +725,9 @@ func (m model) View() string {
 	if m.subInfo != "" {
 		sub += dimStyle.Render("   subs: " + m.subInfo)
 	}
+	if m.audioInfo != "" {
+		sub += dimStyle.Render("   audio: " + m.audioInfo)
+	}
 
 	bar := m.prog.ViewAs(pct)
 	times := fmt.Sprintf("%s / %s", fmtDur(m.pos), fmtDur(m.dur))
@@ -664,7 +735,11 @@ func (m model) View() string {
 		times += "  → seeking…"
 	}
 	if m.switching {
-		times += "  → switching subtitles…"
+		if m.switchKind == pickAudio {
+			times += "  → switching audio…"
+		} else {
+			times += "  → switching subtitles…"
+		}
 	}
 
 	vol := ""
@@ -677,11 +752,15 @@ func (m model) View() string {
 	}
 
 	status := fmt.Sprintf("%s   %s%s", stateStyle.Render(prettyState(m.state)), times, vol)
-	hints := dimStyle.Render("space play/pause   ←/→ seek 10s   ↑/↓ volume   m mute   s subtitles   n next   q quit")
+	audioHint := ""
+	if m.audioInfo != "" {
+		audioHint = "   a audio"
+	}
+	hints := dimStyle.Render("space play/pause   ←/→ seek 10s   ↑/↓ volume   m mute   s subtitles" + audioHint + "   n next   q quit")
 
 	out := fmt.Sprintf("\n %s\n %s\n\n %s\n %s\n", header, sub, bar, status)
-	if m.subMenuOpen {
-		out += "\n" + m.renderSubMenu()
+	if m.menuOpen {
+		out += "\n" + m.renderMenu()
 	}
 	out += "\n " + hints + "\n"
 	if m.lastErr != nil {
@@ -712,42 +791,58 @@ func (m model) viewConnecting() string {
 	return b.String()
 }
 
-// renderSubMenu renders the subtitle picker overlay: one row per choice, the
-// cursor marked with ">", and the currently active track tagged. Only the visible
-// window is drawn (see subVisibleRows) — a release can carry 40+ tracks — with a
-// counter in the header and a footer showing how many rows are off-screen.
-func (m model) renderSubMenu() string {
-	active := -1
-	if sc, ok := m.ctrl.(SubtitleController); ok {
-		active = sc.ActiveSubtitle()
+// activeChoice is the picker row currently in effect for the open picker, or -1.
+func (m model) activeChoice() int {
+	switch m.menuKind {
+	case pickAudio:
+		if ac, ok := m.ctrl.(AudioController); ok {
+			return ac.ActiveAudio()
+		}
+	default:
+		if sc, ok := m.ctrl.(SubtitleController); ok {
+			return sc.ActiveSubtitle()
+		}
 	}
-	total := len(m.subChoices)
-	visible := m.subVisibleRows()
+	return -1
+}
+
+// renderMenu renders the picker overlay: one row per choice, the cursor marked
+// with ">", and the currently active track tagged. Only the visible window is
+// drawn (see menuVisibleRows) — a release can carry 40+ tracks — with a counter
+// in the header and a footer showing how many rows are off-screen.
+func (m model) renderMenu() string {
+	active := m.activeChoice()
+	total := len(m.menuChoices)
+	visible := m.menuVisibleRows()
 	// Clamp defensively: View must not depend on Update having already fixed the
 	// offset (e.g. the very first frame, before any resize or keystroke).
-	start := scrollFor(m.subCursor, m.subScroll, visible, total)
+	start := scrollFor(m.menuCursor, m.menuScroll, visible, total)
 	end := start + visible
 	if end > total {
 		end = total
 	}
 
 	var b strings.Builder
-	head := "Subtitles  (↑/↓ select · enter apply · esc cancel)"
+	name := "Subtitles"
+	if m.menuKind == pickAudio {
+		name = "Audio"
+	}
+	head := name + "  (↑/↓ select · enter apply · esc cancel)"
 	if total > visible {
-		head = fmt.Sprintf("Subtitles  (↑/↓ select · pgup/pgdn page · g/G ends · enter apply · esc cancel)   %d/%d",
-			m.subCursor+1, total)
+		head = fmt.Sprintf("%s  (↑/↓ select · pgup/pgdn page · g/G ends · enter apply · esc cancel)   %d/%d",
+			name, m.menuCursor+1, total)
 	}
 	b.WriteString(" " + dimStyle.Render(head) + "\n")
 
 	for i := start; i < end; i++ {
-		row := "    " + m.subChoices[i]
-		if i == m.subCursor {
-			row = "  > " + m.subChoices[i]
+		row := "    " + m.menuChoices[i]
+		if i == m.menuCursor {
+			row = "  > " + m.menuChoices[i]
 		}
 		if i == active {
 			row += "   ● active"
 		}
-		if i == m.subCursor {
+		if i == m.menuCursor {
 			b.WriteString(stateStyle.Render(row))
 		} else {
 			b.WriteString(dimStyle.Render(row))

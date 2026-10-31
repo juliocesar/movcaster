@@ -58,6 +58,9 @@ type Cast struct {
 	forceTranscode bool             // carry req.ForceTranscode for the codec fallback
 	subChoices     []subChoice      // picker entries, built once
 	activeSub      int              // index into subChoices (guarded by mu)
+	subOpts        SubtitleOptions  // options behind the live delivery (guarded by mu)
+	audio          int              // live audio stream a:N (guarded by mu)
+	audioChoices   []string         // audio picker labels, indexed by a:N
 
 	// resume persistence (nil => disabled)
 	resume     resumeStore
@@ -393,7 +396,7 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 	// not the raw --sub flag. It is silent, so Start reports the outcome itself.
 	subOpts := req.Subtitle
 	subOpts.Sidecar = prep.Sidecar
-	label, build, resoft, err := a.buildDelivery(srv, &media, abs, tmpDir, prep.Info, subOpts, req.ForceTranscode, startOffset)
+	label, build, resoft, err := a.buildDelivery(srv, &media, abs, tmpDir, prep.Info, subOpts, prep.Audio, req.ForceTranscode, startOffset)
 	if err != nil {
 		_ = srv.Shutdown(context.Background())
 		_ = os.RemoveAll(tmpDir)
@@ -403,6 +406,9 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		a.emit(Info, "Transcoding for codec compatibility...")
 	} else if label != "" {
 		a.emit(Info, "Subtitles: %s", label)
+	}
+	if al := audioTrackLabel(prep.Info, prep.Audio); al != "" {
+		a.emit(Info, "Audio: %s", al)
 	}
 	if startOffset > 0 {
 		a.emit(Info, "Resuming at %s", clock(startOffset))
@@ -445,6 +451,9 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 		forceTranscode: req.ForceTranscode,
 		subChoices:     choices,
 		activeSub:      activeSubFor(choices, prep.Strategy, prep.Sidecar),
+		subOpts:        subOpts,
+		audio:          prep.Audio,
+		audioChoices:   buildAudioChoices(prep.Info),
 		// Hold an idle-sleep assertion so a sleeping display doesn't stall the
 		// stream; Close releases it. (See inhibitSleep.)
 		releaseAwake: inhibitSleep(),
@@ -493,14 +502,15 @@ func applyTranscode(srv MediaServer, media *renderer.Media, build func(time.Dura
 }
 
 // buildDelivery resets the server+media to a direct-play baseline, then applies
-// the chosen subtitle strategy and codec-compatibility fallback, returning a UI
-// label and (for transcode modes) the ffmpeg arg builder. ss is the absolute
+// the chosen subtitle strategy and the codec/audio-track fallback, returning a UI
+// label and (for transcode modes) the ffmpeg arg builder. audio is the a:N stream
+// the cast carries. ss is the absolute
 // offset a transcode stream should start at (0 for a fresh cast; the resume/seek
 // position otherwise). It performs no TV I/O and never emits, so it is safe to
 // call during a live switch without corrupting the TUI. It is idempotent across
 // mode flips: each call re-establishes the baseline before applying.
 func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir string,
-	info *probe.MediaInfo, sub SubtitleOptions, forceTranscode bool, ss time.Duration,
+	info *probe.MediaInfo, sub SubtitleOptions, audio int, forceTranscode bool, ss time.Duration,
 ) (label string, build func(time.Duration) []string, resoft softSubFn, err error) {
 
 	// Baseline: direct-play the original file, no subs.
@@ -521,21 +531,23 @@ func (a *App) buildDelivery(srv MediaServer, media *renderer.Media, abs, tmpDir 
 	// transcoded stream is rebased to start at 0, so soft cue times must be
 	// rebased by the same ss to stay in step (direct-play keeps the file's own
 	// absolute timeline, so it stays at 0).
-	plan := codecPlan(info, forceTranscode)
+	plan := codecPlan(info, forceTranscode, audio)
 	subOffset := time.Duration(0)
-	if plan.Kind == TranscodeCodec {
+	if plan.Kind != TranscodeNone {
 		subOffset = ss
 	}
 
-	label, build, resoft, err = applySubtitles(srv, media, abs, tmpDir, dec, ss, subOffset)
+	label, build, resoft, err = applySubtitles(srv, media, abs, tmpDir, dec, audio, ss, subOffset)
 	if err != nil {
 		return "", nil, nil, err
 	}
 
-	// Codec-compatibility fallback: only when subs didn't already force a transcode.
-	if build == nil && plan.Kind == TranscodeCodec {
-		build = func(s time.Duration) []string { return transcode.Args(abs, s, plan.Video, plan.Audio) }
-		if label == "" {
+	// Codec/audio-track fallback: only when subs didn't already force a transcode.
+	// A mux-soft file already carries just the chosen track, so it needs no remux.
+	remux := plan.Kind == TranscodeAudio && dec.Kind != subs.MuxSoft
+	if build == nil && (plan.Kind == TranscodeCodec || remux) {
+		build = func(s time.Duration) []string { return transcode.Args(abs, s, plan.Video, plan.Audio, audio) }
+		if label == "" && plan.Kind == TranscodeCodec {
 			label = "transcode"
 		}
 		applyTranscode(srv, media, build, ss)
@@ -570,10 +582,11 @@ func clearSoft(media *renderer.Media) {
 // applySubtitles executes the chosen subtitle strategy against the server +
 // media metadata, returning a UI label and (for burn-in) a transcode-args
 // builder starting at offset ss. It is silent (no events, no prints) so the same
-// helper serves both the initial cast and a live switch.
+// helper serves both the initial cast and a live switch. audio is the a:N stream
+// a burn-in or mux-soft output carries.
 // subOffset is the offset the served cue times must be rebased by (0 to keep the
 // file's absolute timeline); see softSubFn.
-func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, dec subs.Decision, ss, subOffset time.Duration) (label string, build func(time.Duration) []string, resoft softSubFn, err error) {
+func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, dec subs.Decision, audio int, ss, subOffset time.Duration) (label string, build func(time.Duration) []string, resoft softSubFn, err error) {
 	switch dec.Kind {
 	case subs.None:
 		return "", nil, nil, nil
@@ -623,7 +636,7 @@ func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, 
 	case subs.MuxSoft:
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		muxed, err := subs.MuxSoftRemux(ctx, abs, *dec.Track, tmpDir)
+		muxed, err := subs.MuxSoftRemux(ctx, abs, *dec.Track, audio, tmpDir)
 		if err != nil {
 			return "", nil, nil, err
 		}
@@ -634,7 +647,7 @@ func applySubtitles(srv MediaServer, media *renderer.Media, abs, tmpDir string, 
 
 	case subs.Burn:
 		track := *dec.Track
-		build = func(s time.Duration) []string { return subs.BurnArgs(abs, track, s) }
+		build = func(s time.Duration) []string { return subs.BurnArgs(abs, track, audio, s) }
 		applyTranscode(srv, media, build, ss)
 		label = fmt.Sprintf("burn-in: track %d (%s)", dec.Track.SubIndex, dec.Track.Codec)
 		return label, build, nil, nil
@@ -781,41 +794,70 @@ func (c *Cast) ActiveSubtitle() int {
 
 // SetSubtitle switches to the subtitle choice at idx (into SubtitleChoices()),
 // rebuilding the delivery for that track and restarting playback at the current
-// position. It is serialized against seeks via seekMu. A switch always resumes
-// playback (issues Play), even if the cast was paused.
+// position. The audio track is kept. A switch always resumes playback (issues
+// Play), even if the cast was paused.
 func (c *Cast) SetSubtitle(ctx context.Context, idx int) error {
 	if idx < 0 || idx >= len(c.subChoices) {
 		return fmt.Errorf("subtitle index %d out of range", idx)
 	}
+	return c.restartWith(ctx, func(sub *SubtitleOptions, _ *int) {
+		*sub = c.subChoices[idx].opts
+	}, func() { c.activeSub = idx })
+}
 
-	// Serialize against seek-restarts; both mutate the server/media + buildArgs.
+// AudioChoices returns the audio picker labels, indexed by a:N.
+func (c *Cast) AudioChoices() []string { return c.audioChoices }
+
+// ActiveAudio returns the a:N index of the audio track being cast.
+func (c *Cast) ActiveAudio() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.audio
+}
+
+// AudioInfo labels the live audio track, or "" for a single-track file.
+func (c *Cast) AudioInfo() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return audioTrackLabel(c.info, c.audio)
+}
+
+// SetAudio switches to audio track a:idx, keeping the subtitle delivery, and
+// restarts playback at the current position (direct play when the TV picks that
+// track itself, else a copy-only remux). Like SetSubtitle it always resumes.
+func (c *Cast) SetAudio(ctx context.Context, idx int) error {
+	if idx < 0 || idx >= len(c.audioChoices) {
+		return fmt.Errorf("audio track %d out of range", idx)
+	}
+	return c.restartWith(ctx, func(_ *SubtitleOptions, audio *int) { *audio = idx }, nil)
+}
+
+// restartWith rebuilds the delivery from the live subtitle options and audio
+// track, as edited by change, and re-points the TV at it from the current
+// position. commit (optional) runs under c.mu alongside the state update. It is
+// serialized against seek-restarts via seekMu, since both mutate the server/media
+// and buildArgs.
+func (c *Cast) restartWith(ctx context.Context, change func(sub *SubtitleOptions, audio *int), commit func()) error {
 	c.seekMu.Lock()
 	defer c.seekMu.Unlock()
 
 	// Resume where we are now. lastPos is the most recent observed absolute position.
 	c.mu.Lock()
-	pos := c.lastPos
+	pos, sub, audio := c.lastPos, c.subOpts, c.audio
 	c.mu.Unlock()
 	if pos < 0 {
 		pos = 0
 	}
+	change(&sub, &audio)
 
-	choice := c.subChoices[idx]
 	label, build, resoft, err := c.app.buildDelivery(c.srv, &c.media, c.abs, c.tmpDir,
-		c.info, choice.opts, c.forceTranscode, pos) // ss=pos => transcode starts at pos in one shot
+		c.info, sub, audio, c.forceTranscode, pos) // ss=pos => transcode starts at pos in one shot
 	if err != nil {
 		return err
 	}
 
-	// Re-point the TV at the fresh stream and resume (Stop -> settle -> SetURI -> Play).
-	if err := startPlayback(ctx, c.r, c.media); err != nil {
-		return err
-	}
-	// Direct-play resume: seek after Play (transcode resume is baked into ss above).
-	if build == nil && pos > 0 {
-		_ = retrySOAP(ctx, 4, 3*time.Second, func(ic context.Context) error { return c.r.Seek(ic, pos) })
-	}
-
+	// The server now serves the new delivery, so record it before touching the TV:
+	// if the handshake below fails, later seeks must still match what is streamed.
 	c.mu.Lock()
 	c.buildArgs = build
 	c.resoft = resoft
@@ -825,9 +867,37 @@ func (c *Cast) SetSubtitle(ctx context.Context, idx int) error {
 		c.ssOffset = 0
 	}
 	c.subInfo = label
-	c.activeSub = idx
+	c.subOpts = sub
+	c.audio = audio
+	if commit != nil {
+		commit()
+	}
 	c.mu.Unlock()
+
+	// Re-point the TV at the fresh stream and resume (Stop -> settle -> SetURI -> Play).
+	if err := setTransportURI(ctx, c.r, c.media); err != nil {
+		return err
+	}
+	if err := beginPlayback(ctx, c.r); err != nil && !c.playingAnyway(ctx) {
+		return err
+	}
+	// Direct-play resume: seek after Play (transcode resume is baked into ss above).
+	if build == nil && pos > 0 {
+		_ = retrySOAP(ctx, 4, 3*time.Second, func(ic context.Context) error { return c.r.Seek(ic, pos) })
+	}
 	return nil
+}
+
+// playingAnyway reports whether the TV ended up playing despite a failed Play.
+// webOS auto-plays a freshly set URI, and a large direct-play file can keep it
+// buffering long enough that every Play is rejected with 701 while the stream
+// starts on its own.
+func (c *Cast) playingAnyway(ctx context.Context) bool {
+	waitTransportSettled(ctx, c.r, 10*time.Second)
+	sctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	state, err := c.r.TransportState(sctx)
+	return err == nil && state == "PLAYING"
 }
 
 // startPlayback points the TV at media for a fresh cast: best-effort Stop, wait

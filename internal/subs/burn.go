@@ -10,14 +10,15 @@ import (
 	"time"
 
 	"github.com/juliocesar/movcaster/internal/probe"
+	"github.com/juliocesar/movcaster/internal/transcode"
 )
 
 // BurnArgs builds the ffmpeg argument list that burns a subtitle track into the
 // video and streams a fragmented MP4 on stdout (pipe:1). ss is the input-seek
 // offset (0 to start from the beginning); the seek-restart logic relaunches with
-// a new ss on scrub. Bitmap tracks use the overlay filter; text tracks use the
-// subtitles filter.
-func BurnArgs(input string, track probe.SubTrack, ss time.Duration) []string {
+// a new ss on scrub. audioTrack is the a:N stream to carry. Bitmap tracks use the
+// overlay filter; text tracks use the subtitles filter.
+func BurnArgs(input string, track probe.SubTrack, audioTrack int, ss time.Duration) []string {
 	// The subtitles filter opens the file with its own demuxer and reads absolute
 	// cue times, so it ignores -ss: input-seeking rebases frame timestamps to 0
 	// while the cues stay absolute, and every cue lands in the "past" — the burn
@@ -50,7 +51,7 @@ func BurnArgs(input string, track probe.SubTrack, ss time.Duration) []string {
 		}
 		args = append(args, "-vf", vf, "-map", "0:v:0")
 	}
-	args = append(args, "-map", "0:a:0?", "-dn", "-map_chapters", "-1")
+	args = append(args, "-map", transcode.AudioMap(audioTrack), "-dn", "-map_chapters", "-1")
 	if textSeek {
 		args = append(args, "-af", "asetpts=PTS-STARTPTS")
 	}
@@ -72,14 +73,15 @@ func escapeFilterPath(p string) string {
 	return p
 }
 
-// MuxSoftRemux copies the video, first audio, and the chosen bitmap subtitle into
-// a fresh Matroska file in destDir, then returns its path. This is the M6a
-// experiment: whether webOS will demux a freshly muxed image-sub track over DLNA.
-func MuxSoftRemux(ctx context.Context, input string, track probe.SubTrack, destDir string) (string, error) {
+// MuxSoftRemux copies the video, the a:audioTrack audio, and the chosen bitmap
+// subtitle into a fresh Matroska file in destDir, then returns its path. This is
+// the M6a experiment: whether webOS will demux a freshly muxed image-sub track
+// over DLNA.
+func MuxSoftRemux(ctx context.Context, input string, track probe.SubTrack, audioTrack int, destDir string) (string, error) {
 	out := filepath.Join(destDir, "muxed.mkv")
 	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-y", "-i", input,
-		"-map", "0:v:0", "-map", "0:a:0?", "-map", fmt.Sprintf("0:s:%d", track.SubIndex),
+		"-map", "0:v:0", "-map", transcode.AudioMap(audioTrack), "-map", fmt.Sprintf("0:s:%d", track.SubIndex),
 		"-c", "copy",
 		"-disposition:s:0", "default",
 		out,

@@ -35,6 +35,7 @@ func main() {
 		burn       = flag.Bool("burn", false, "burn the selected subtitle track into the video")
 		soft       = flag.Bool("soft", false, "force soft subs (errors if the track is bitmap)")
 		subTrack   = flag.Int("sub-track", -1, "embedded subtitle track index to use (0-based)")
+		audioTrack = flag.Int("audio-track", -1, "audio track index to use (0-based, see --info); default: English if present")
 		muxSoft    = flag.Bool("mux-soft", false, "remux a bitmap track as soft instead of burning (experimental; toggle on TV)")
 		tcode      = flag.Bool("transcode", false, "force a codec-compatibility transcode")
 		info       = flag.Bool("info", false, "probe the file, print streams and the subtitle decision, then exit")
@@ -71,6 +72,7 @@ func main() {
 	// cleared when advancing).
 	base := core.CastRequest{
 		Target:         *target,
+		AudioTrack:     *audioTrack,
 		ForceTranscode: *tcode,
 		Subtitle: core.SubtitleOptions{
 			Sidecar:    *sub,
@@ -172,6 +174,7 @@ Usage:
   movcaster <file> --info            show streams + chosen subtitle strategy
   movcaster <file> --sub foo.srt     force an explicit soft subtitle
   movcaster <file> --sub-track N     pick embedded subtitle track N (see --info)
+  movcaster <file> --audio-track N   pick audio track N (see --info)
   movcaster <file> --burn            burn the selected subtitle into the video
   movcaster <file> --soft            force soft subs (errors on bitmap tracks)
   movcaster <file> --mux-soft        remux a bitmap track as soft (experimental)
@@ -188,6 +191,11 @@ Subtitles: a sidecar .srt/.vtt is auto-detected and sent as soft subs; embedded
 text tracks are extracted to soft; bitmap tracks (PGS/VobSub/dvd_subtitle) are
 burned in on the fly. The chosen device is remembered for next time.
 
+Audio: with several audio tracks the English one plays by default (else the
+file's default track). Such files stream a copy-only remux carrying just the
+chosen track (the TV would otherwise pick one itself), so seeks rebuffer for a
+moment instead of jumping instantly.
+
 Resume: playback positions are remembered per file; re-casting a file picks up
 where you stopped. --resume (no file argument) continues the most recently played
 video, then auto-advances like a normal cast unless --no-next is given.
@@ -199,7 +207,7 @@ show, next season/episode) is detected and cast automatically. Press n to skip
 to it manually, or pass --no-next to disable the automatic advance.
 
 Controls (TUI): space play/pause, left/right seek, up/down volume, m mute,
-n next episode, q quit.
+s subtitles, a audio track, n next episode, q quit.
 `)
 }
 
@@ -255,6 +263,7 @@ func runInfo(app *core.App, req core.CastRequest) error {
 		return prep.DecideErr
 	}
 	fmt.Print(prep.DescribeStrategy())
+	fmt.Print(prep.DescribeAudio())
 	fmt.Print(prep.DescribeCodec())
 	return nil
 }
@@ -306,6 +315,7 @@ func runCast(app *core.App, req core.CastRequest, next nextProvider, autoNext bo
 					Title:     cast.Title(),
 					Device:    cast.Device(),
 					SubInfo:   cast.SubInfo(),
+					AudioInfo: cast.AudioInfo(),
 					HasVolume: cast.HasVolume(),
 				}, nil
 			})

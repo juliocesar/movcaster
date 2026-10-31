@@ -45,11 +45,23 @@ type SubTrack struct {
 	Forced   bool // disposition forced: only covers foreign-dialogue lines, a poor default
 }
 
+// AudioTrack is one audio stream.
+type AudioTrack struct {
+	Index      int // ffmpeg stream index
+	AudioIndex int // index among audio streams only (use with -map 0:a:<AudioIndex>)
+	Codec      string
+	Language   string
+	Title      string
+	Channels   int // 0 when ffprobe doesn't report it
+	Default    bool
+}
+
 // MediaInfo summarizes a probed file.
 type MediaInfo struct {
 	Duration   time.Duration
 	VideoCodec string
-	AudioCodec string
+	AudioCodec string // first audio stream's codec ("" if none)
+	Audio      []AudioTrack
 	Subtitles  []SubTrack
 }
 
@@ -57,6 +69,7 @@ type ffStream struct {
 	Index       int               `json:"index"`
 	CodecName   string            `json:"codec_name"`
 	CodecType   string            `json:"codec_type"`
+	Channels    int               `json:"channels"`
 	Tags        map[string]string `json:"tags"`
 	Disposition map[string]int    `json:"disposition"`
 }
@@ -98,7 +111,7 @@ func Probe(ctx context.Context, path string) (*MediaInfo, error) {
 		mi.Duration = time.Duration(d * float64(time.Second))
 	}
 
-	subSeq := 0
+	subSeq, audioSeq := 0, 0
 	for _, s := range ff.Streams {
 		switch s.CodecType {
 		case "video":
@@ -113,6 +126,16 @@ func Probe(ctx context.Context, path string) (*MediaInfo, error) {
 			if mi.AudioCodec == "" {
 				mi.AudioCodec = s.CodecName
 			}
+			mi.Audio = append(mi.Audio, AudioTrack{
+				Index:      s.Index,
+				AudioIndex: audioSeq,
+				Codec:      s.CodecName,
+				Language:   s.Tags["language"],
+				Title:      s.Tags["title"],
+				Channels:   s.Channels,
+				Default:    s.Disposition["default"] == 1,
+			})
+			audioSeq++
 		case "subtitle":
 			t := SubTrack{
 				Index:    s.Index,

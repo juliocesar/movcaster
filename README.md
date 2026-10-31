@@ -82,6 +82,9 @@ movcaster --sub Movie.es.srt Movie.mkv
 # The file has five subtitle tracks and you want track 3 (run --info to list them):
 movcaster --sub-track 3 Movie.mkv
 
+# Dual-audio release? English plays by default. Want the other one (see --info):
+movcaster --audio-track 0 Movie.mkv
+
 # Force the burned-in path (always works, even on the weirdest bitmap subs):
 movcaster --burn Movie.mkv
 
@@ -104,7 +107,7 @@ shuffles its DLNA port around.
 
 Once it's playing you get a little control panel:
 
-`space` play/pause · `←/→` seek 10s · `↑/↓` volume · `m` mute · `s` subtitles · `n` next episode · `q` quit
+`space` play/pause · `←/→` seek 10s · `↑/↓` volume · `m` mute · `s` subtitles · `a` audio · `n` next episode · `q` quit
 
 Press `s` to open a subtitle picker: it lists every embedded track, any sidecar
 file, and **Off**. Pick one and movcaster re-points the TV at a freshly built
@@ -113,6 +116,12 @@ stream and resumes where you were (text tracks go soft, bitmap tracks burn in).
 The picker opens on the track that's currently active and scrolls, which matters
 for releases that ship dozens of languages: `↑/↓` move a row, `pgup/pgdn` a
 screenful, `g`/`G` jump to the top and bottom, `enter` applies, `esc` cancels.
+
+Press `a` for the same picker over the audio tracks (only when the file has more
+than one). English is picked by default when there is an English track. Given
+the raw file, the TV picks a track by itself, so files with several audio tracks
+stream a copy-only remux carrying just the chosen one: no quality loss and barely
+any CPU, but each seek rebuffers for a second or two instead of jumping instantly.
 
 ## All the flags
 
@@ -123,6 +132,7 @@ movcaster <file> -t TARGET         target a device (IP, IP:port, or device URL)
 movcaster <file> --info            print streams + the chosen subtitle strategy
 movcaster <file> --sub foo.srt     force an explicit soft subtitle
 movcaster <file> --sub-track N     pick embedded subtitle track N (see --info)
+movcaster <file> --audio-track N   pick audio track N (default: English if present)
 movcaster <file> --burn            burn the selected subtitle into the video
 movcaster <file> --soft            force soft subs (errors on bitmap tracks)
 movcaster <file> --mux-soft        remux a bitmap track as soft (experimental)

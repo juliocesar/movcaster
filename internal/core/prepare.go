@@ -28,6 +28,7 @@ type CastRequest struct {
 	File           string
 	Target         string // IP / IP:port / device URL / "" (auto + saved)
 	Subtitle       SubtitleOptions
+	AudioTrack     int // audio stream a:N; -1 = auto (English if present)
 	ForceTranscode bool
 }
 
@@ -41,14 +42,18 @@ const (
 	TranscodeBurn
 	// TranscodeCodec re-encodes for codec compatibility.
 	TranscodeCodec
+	// TranscodeAudio remuxes (copy-only) to carry an audio track the TV would not
+	// pick from the raw file.
+	TranscodeAudio
 )
 
-// TranscodePlan summarizes the transcode decision (filled by Start; Prepare
-// leaves it None — codec fallback needs no TV but is reported only at Start).
+// TranscodePlan summarizes the transcode decision for the codecs and the chosen
+// audio track (a burn-in strategy may supersede it at Start).
 type TranscodePlan struct {
-	Kind  TranscodeKind
-	Video bool // codec: re-encode video
-	Audio bool // codec: re-encode audio
+	Kind       TranscodeKind
+	Video      bool // codec: re-encode video
+	Audio      bool // codec: re-encode audio
+	AudioTrack int  // the a:N stream the output carries
 }
 
 // Preparation is the result of planning a cast: probe + subtitle strategy. It
@@ -58,9 +63,10 @@ type Preparation struct {
 	Info      *probe.MediaInfo // nil if probe failed (see ProbeErr)
 	Sidecar   string           // resolved sidecar/--sub path, or ""
 	Strategy  subs.Decision    // valid only if DecideErr == nil
-	Codec     TranscodePlan    // codec-compatibility need (subs may override at Start)
+	Audio     int              // resolved audio stream a:N
+	Codec     TranscodePlan    // codec/audio-track need (subs may override at Start)
 	ProbeErr  error            // non-fatal for casting, fatal for --info
-	DecideErr error            // subtitle strategy error (e.g. --soft on bitmap)
+	DecideErr error            // strategy error (e.g. --soft on bitmap, unknown --audio-track)
 }
 
 // Prepare probes the file and decides the subtitle strategy. It performs no
@@ -87,7 +93,9 @@ func (a *App) Prepare(ctx context.Context, req CastRequest) (*Preparation, error
 		p.Info = info
 	}
 
-	p.Codec = codecPlan(p.Info, req.ForceTranscode)
+	audio, aerr := selectAudio(p.Info, req.AudioTrack)
+	p.Audio = audio
+	p.Codec = codecPlan(p.Info, req.ForceTranscode, audio)
 
 	dec, derr := subs.Decide(subs.Request{
 		Info:        p.Info,
@@ -102,6 +110,9 @@ func (a *App) Prepare(ctx context.Context, req CastRequest) (*Preparation, error
 		p.DecideErr = derr
 	} else {
 		p.Strategy = dec
+	}
+	if aerr != nil && p.DecideErr == nil {
+		p.DecideErr = aerr
 	}
 	return p, nil
 }
@@ -136,7 +147,17 @@ func (p *Preparation) DescribeStreams() string {
 	}
 	fmt.Fprintf(&b, "  duration: %s\n", p.Info.Duration.Round(time.Second))
 	fmt.Fprintf(&b, "  video:    %s\n", p.Info.VideoCodec)
-	fmt.Fprintf(&b, "  audio:    %s\n", p.Info.AudioCodec)
+	switch len(p.Info.Audio) {
+	case 0:
+		fmt.Fprintln(&b, "  audio:    none")
+	case 1:
+		fmt.Fprintf(&b, "  audio:    %s\n", strings.TrimPrefix(audioLabel(p.Info.Audio[0]), "a:0 — "))
+	default:
+		fmt.Fprintln(&b, "  audio tracks:")
+		for _, t := range p.Info.Audio {
+			fmt.Fprintf(&b, "    %s\n", audioLabel(t))
+		}
+	}
 	if len(p.Info.Subtitles) == 0 {
 		fmt.Fprintln(&b, "  subtitles: none embedded")
 	} else {
@@ -163,6 +184,17 @@ func (p *Preparation) DescribeStrategy() string {
 	return fmt.Sprintf("  -> strategy: %s  (%s)\n", p.Strategy.Kind, p.Strategy.Reason)
 }
 
+// DescribeAudio renders the chosen-audio line `--info` prints, or "" when the
+// file has fewer than two tracks (nothing was chosen).
+func (p *Preparation) DescribeAudio() string {
+	label := audioTrackLabel(p.Info, p.Audio)
+	if label == "" {
+		return ""
+	}
+	// audioTrackLabel is non-empty only for multi-track files, which always remux.
+	return fmt.Sprintf("  -> audio: %s  (remux: the TV would otherwise pick a track itself)\n", label)
+}
+
 // DescribeCodec renders the codec-compatibility line `--info` prints, or "" when
 // the file direct-plays. A burn-in strategy transcodes anyway, so the streams
 // listed here are the ones that would be re-encoded on top of the burn.
@@ -175,19 +207,29 @@ func (p *Preparation) DescribeCodec() string {
 		what = append(what, "video "+p.Info.VideoCodec)
 	}
 	if p.Codec.Audio {
-		what = append(what, "audio "+p.Info.AudioCodec)
+		codec := p.Info.AudioCodec
+		if p.Codec.AudioTrack < len(p.Info.Audio) {
+			codec = p.Info.Audio[p.Codec.AudioTrack].Codec
+		}
+		what = append(what, "audio "+codec)
 	}
 	return fmt.Sprintf("  -> transcode: %s not supported by the renderer\n", strings.Join(what, " + "))
 }
 
-// codecPlan computes the codec-compatibility transcode need (no subs involved).
-func codecPlan(info *probe.MediaInfo, force bool) TranscodePlan {
-	needV, needA := transcode.Needs(info)
+// codecPlan computes the transcode need for the codecs and the chosen audio
+// track a:N (no subs involved): re-encode what the renderer can't play, else
+// remux copy-only when the file has other tracks the TV could pick instead, else
+// direct play.
+func codecPlan(info *probe.MediaInfo, force bool, audio int) TranscodePlan {
+	needV, needA := transcode.Needs(info, audio)
 	if force {
 		needV, needA = true, true
 	}
-	if needV || needA {
-		return TranscodePlan{Kind: TranscodeCodec, Video: needV, Audio: needA}
+	switch {
+	case needV || needA:
+		return TranscodePlan{Kind: TranscodeCodec, Video: needV, Audio: needA, AudioTrack: audio}
+	case !directPlaysAudio(info):
+		return TranscodePlan{Kind: TranscodeAudio, AudioTrack: audio}
 	}
-	return TranscodePlan{Kind: TranscodeNone}
+	return TranscodePlan{Kind: TranscodeNone, AudioTrack: audio}
 }

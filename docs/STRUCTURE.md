@@ -48,7 +48,7 @@ then `Preparation.DescribeStreams()` / `DescribeStrategy()` / `DescribeCodec()` 
 ### `main` (main.go)
 Thin CLI client: flag parsing + map to `core.CastRequest` + render events. No
 orchestration logic.
-- `main()` — flags: `-l -t -sub -no-subs -burn -soft -sub-track -mux-soft -transcode -info`.
+- `main()` — flags: `-l -t -sub -no-subs -burn -soft -sub-track -audio-track -mux-soft -transcode -info`.
   Builds one `core.App` with an `OnEvent` reporter. `-no-next` disables auto-advance.
   `-resume` (no file arg) casts the last played video via `resumeFile` (newest still-existing
   entry from `resume.Store.Recent()`, skipping missing ones), then runs like a normal cast;
@@ -96,9 +96,10 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
 - `buildDelivery(...) → (label, build, resoft, err)` — baseline direct-play, then
   `subs.Decide` + `codecPlan` (computed *before* subtitles, since a transcode dictates the
   sub offset) + `applySubtitles`. `resoft` is the `softSubFn` `Seek`/`SetSubtitle` re-run.
-- `Prepare(ctx, CastRequest) → *Preparation` — pure planning: probe + `subs.Decide`, no
-  TV/network I/O. `Preparation{AbsPath, Info, Sidecar, Strategy, Codec, ProbeErr, DecideErr}` +
-  `DescribeStreams()`/`DescribeStrategy()`/`DescribeCodec()`. `Codec` is the `codecPlan` result
+- `Prepare(ctx, CastRequest) → *Preparation` — pure planning: probe + `subs.Decide` +
+  `selectAudio`, no TV/network I/O. `Preparation{AbsPath, Info, Sidecar, Strategy, Audio, Codec,
+  ProbeErr, DecideErr}` + `DescribeStreams()`/`DescribeStrategy()`/`DescribeAudio()`/`DescribeCodec()`.
+  An unknown `--audio-track` lands in `DecideErr`. `Codec` is the `codecPlan` result
   (needs no TV), so `--info` reports a codec-compat transcode; `Start` recomputes it since a
   burn-in strategy supersedes it. Reused by `--info` and `Start`.
 - `Start(ctx, CastRequest) → (*Cast, *Preparation)` — resolve device (emit "Casting to",
@@ -136,6 +137,19 @@ progress is reported via `Options.OnEvent`, status via the live `Cast`.
   HasVolume/Volume/SetVolume/Mute`, plus `Title/Device/SubInfo`, `Status(ctx)`, `Close(ctx)`.
   Direct-play vs transcode seek-restart logic (Stop→settle→retry SetURI/Play, `seekMu`
   serialized) lives here, moved verbatim from the old Session.
+- Audio tracks (audio.go): `CastRequest.AudioTrack` (a:N, -1 = auto). `selectAudio` = explicit
+  index (must exist), else the first English track (default-flagged first, commentary only if
+  nothing else), else `defaultAudio` (first default-flagged, else a:0). `directPlaysAudio` is
+  true only for files with at most one audio track; on any multi-track file `codecPlan` returns
+  `TranscodeAudio` (copy-only remux mapping `0:a:N`), whichever track is chosen. The chosen index is threaded through
+  `buildDelivery` → `applySubtitles` (burn/mux-soft) and `transcode.Args`. Live switching:
+  `AudioChoices()`/`ActiveAudio()`/`AudioInfo()`/`SetAudio(ctx, idx)`; `SetAudio` and
+  `SetSubtitle` share `restartWith`, which rebuilds from the live `subOpts` + `audio` (both
+  guarded by `c.mu`) so each switch keeps the other's choice. It records the new delivery
+  state *before* the TV handshake (the server already serves it, so a failed handshake must
+  not leave seeks restarting the old stream), and a rejected Play counts as success when the
+  TV reports PLAYING anyway (`playingAnyway`: webOS auto-plays a set URI and can 701 every
+  Play while buffering a large direct-play file).
 - Live subtitle switching: `SubtitleChoices()` / `ActiveSubtitle()` expose the picker
   (sidecar + each embedded track + Off), and `SetSubtitle(ctx, idx)` switches to a choice
   by rebuilding delivery via `buildDelivery` at the current position and restarting through
@@ -203,10 +217,12 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
 - `setDLNAHeaders` — transferMode/realTimeInfo/contentFeatures.dlna.org; OP=01 if seekable.
 
 ### `internal/probe` — ffprobe wrapper + sub classification
-- `Probe(ctx,path) *MediaInfo{Duration,VideoCodec,AudioCodec,Subtitles[]}` via
+- `Probe(ctx,path) *MediaInfo{Duration,VideoCodec,AudioCodec,Audio[],Subtitles[]}` via
   `ffprobe -print_format json -show_streams -show_format`. Skips attached_pic (cover art).
 - `SubTrack{Index, SubIndex (s:N selector), Codec, Kind, Language, Title, Default, Forced}`.
   `Forced` (disposition) marks a foreign-dialogue-only track that `selectTrack` deprioritizes.
+- `AudioTrack{Index, AudioIndex (a:N selector), Codec, Language, Title, Channels, Default}`.
+  `AudioCodec` is the first audio stream's codec (kept for callers that don't pick a track).
 - `SubKind`: `SubText` (subrip/ass/mov_text/webvtt…) | `SubBitmap` (dvd_subtitle/pgs/vobsub/dvbsub…) | `SubUnknown`.
 
 ### `internal/subs` — strategy + ffmpeg arg/command builders
@@ -217,7 +233,7 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   a forced track only carries foreign-dialogue lines and is a confusing default on English
   releases); ForceSoft (err if bitmap)→SoftExtract; ForceBurn→Burn; auto text→SoftExtract;
   auto bitmap→Burn (or MuxSoft if `MuxSoftTry`). nil-safe on `Info`.
-- `BurnArgs(input,track,ss) []string` (burn.go) — fragmented-mp4-on-pipe ffmpeg. Bitmap:
+- `BurnArgs(input,track,audio,ss) []string` (burn.go) — maps audio `0:a:<audio>?`. — fragmented-mp4-on-pipe ffmpeg. Bitmap:
   `[0:v][0:s:N]overlay`. Text: `subtitles=…:si=N`. `-c:v libx264 -preset veryfast -crf 22`,
   aac, `-movflags +frag_keyframe+empty_moov+default_base_moof`, `-dn -map_chapters -1`. `ss`=input seek.
 - `ExtractText(ctx,input,subIndex,ss,destDir) → srtPath` (extract.go) — `-map 0:s:N -c:s subrip -f srt`.
@@ -227,12 +243,13 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   which callers treat as "no soft subs for this segment", not as a failure.
 - `ShiftText(ctx,srtPath,ss,destDir) → srtPath` (extract.go) — same rebasing for an external
   sidecar; `ss == 0` returns the input untouched.
-- `MuxSoftRemux(ctx,input,track,destDir) → mkvPath` (burn.go) — `-c copy` remux of v+a+sub (experimental 6a).
+- `MuxSoftRemux(ctx,input,track,audio,destDir) → mkvPath` (burn.go) — `-c copy` remux of v+a:N+sub (experimental 6a).
 
 ### `internal/transcode` — codec-compat transcode (no subs)
-- `Needs(info) (video,audio bool)` — true if codec outside `goodVideo`/`goodAudio` allowlists
+- `Needs(info, audio) (video,audio bool)` — judges the chosen a:N track's codec; true if outside `goodVideo`/`goodAudio` allowlists
   (good video: h264/hevc/mpeg4/mpeg2video/vc1/msmpeg4v3; good audio: aac/ac3/eac3/mp3/mp2/dts/flac).
-- `Args(input,ss,tV,tA) []string` — like BurnArgs minus subs; copies stream if not transcoding it.
+- `Args(input,ss,tV,tA,audio) []string` — like BurnArgs minus subs; copies stream if not transcoding it.
+  `tV=tA=false` is the copy-only remux used to carry a non-native audio track. `AudioMap(a)` = `0:a:N?`.
   Adds `+delay_moov` (mandatory whenever audio is copied) and `-use_editlist 0` (webOS chokes
   on the edit lists delay_moov then writes) — see gotchas.
 
@@ -268,6 +285,10 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   counting. `n` sets `OutcomeNext` (Stop→Quit, like `q`).
 - Polling: `tickCmd` every 1s → `pollCmd` (Position+TransportState). **Skipped while `seeking`
   or `switching`** to avoid SOAP contention with a seek-restart / subtitle switch.
+- Track picker: one overlay shared by subtitles (`s`) and audio (`a`, via the optional
+  `AudioController`; opens only with 2+ tracks), keyed by `menuKind`. Fields are `menu*`;
+  `switchDoneMsg` ends either switch and refreshes both header labels (`subs:` / `audio:`,
+  the latter only for multi-track files). The picker's own key or esc closes it.
 - Subtitle picker: `s` opens an overlay listing the choices (cursor on the active one); ↑/↓
   (k/j) move, pgup/pgdn (ctrl+u/ctrl+d) page, home/end (g/G) jump, enter applies
   (`SetSubtitle`, sets `switching` until `subDoneMsg`), esc/`s` cancel.
@@ -403,7 +424,12 @@ mux patterns don't match). `verbose` (`MOVCASTER_VERBOSE`) logs requests.
   track first (default-flagged) that only subtitles foreign-dialogue scenes, so it looks like
   "subs don't work". `selectTrack` skips forced tracks in auto-selection (see `preferNonForced`).
 - **serveTranscode sends headers before launching ffmpeg** so SetAVTransportURI doesn't block.
-- `ss` selectors use `0:s:<SubIndex>` (subtitle-stream index), not the absolute stream index.
+- `ss` selectors use `0:s:<SubIndex>` (subtitle-stream index), not the absolute stream index;
+  audio likewise `0:a:<AudioIndex>`.
+- **The TV picks the audio track of a direct-play file**, by its own preference, not the
+  file's order or default flag (verified: a Spanish a:0 / English a:1 file with no default
+  flags direct-plays as English on webOS). So any multi-track file remuxes copy-only with
+  only the chosen track mapped (seeks become seek-restarts); single-track files direct-play.
 - **macOS idle sleep throttles a cast** → when the laptop display sleeps, the system
   goes idle and suspends our HTTP server + ffmpeg, so the TV stalls ("loading") and
   only resumes on display wake. A live `Cast` holds `caffeinate -i` (idle-sleep

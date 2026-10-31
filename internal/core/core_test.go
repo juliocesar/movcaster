@@ -77,6 +77,8 @@ type fakeRenderer struct {
 	transitioningAfterSet int
 	setMediaCount         int
 	pollsAfterSet         int
+
+	playErr error // returned by every Play (a TV that keeps rejecting it)
 }
 
 // transitioning reports whether the TV is still buffering a freshly-set URI.
@@ -97,6 +99,9 @@ func (r *fakeRenderer) SetMedia(_ context.Context, m renderer.Media) error {
 }
 func (r *fakeRenderer) Play(context.Context) error {
 	r.calls = append(r.calls, "Play")
+	if r.playErr != nil {
+		return r.playErr
+	}
 	if r.transitioning() {
 		return errors.New("701 Transition not available")
 	}
@@ -466,7 +471,7 @@ func TestApplySubtitlesBurn(t *testing.T) {
 	track := probe.SubTrack{SubIndex: 1, Codec: "hdmv_pgs_subtitle", Kind: probe.SubBitmap}
 	dec := subs.Decision{Kind: subs.Burn, Track: &track}
 
-	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0, 0)
+	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +494,7 @@ func TestApplySubtitlesSidecar(t *testing.T) {
 	media := &renderer.Media{}
 	dec := subs.Decision{Kind: subs.SoftSidecar, SidecarPath: "/x/movie.srt"}
 
-	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0, 0)
+	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), dec, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +515,7 @@ func TestApplySubtitlesSidecar(t *testing.T) {
 func TestApplySubtitlesNone(t *testing.T) {
 	s := &fakeServer{}
 	media := &renderer.Media{Seekable: true}
-	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), subs.Decision{Kind: subs.None}, 0, 0)
+	label, build, _, err := applySubtitles(s, media, "/x/movie.mkv", t.TempDir(), subs.Decision{Kind: subs.None}, 0, 0, 0)
 	if err != nil || label != "" || build != nil {
 		t.Fatalf("None: label=%q build!=nil=%v err=%v", label, build != nil, err)
 	}
@@ -534,7 +539,7 @@ func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
 	off := SubtitleOptions{NoSubs: true, TrackIndex: -1}
 
 	assertSoft := func() {
-		_, build, _, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, soft, false, 0)
+		_, build, _, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, soft, 0, false, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -552,7 +557,7 @@ func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
 	assertSoft()
 
 	// soft -> burn: media flips to non-seekable mp4 with subs cleared, build set.
-	_, build, _, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, burn, false, 30*time.Second)
+	_, build, _, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, burn, 0, false, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,7 +572,7 @@ func TestBuildDeliveryIdempotentAcrossModes(t *testing.T) {
 	}
 
 	// burn -> off: back to a clean direct-play baseline, no subs, no transcode.
-	_, build, _, err = a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, off, false, 0)
+	_, build, _, err = a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(), info, off, 0, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -760,17 +765,17 @@ func TestPositionCachesLastPos(t *testing.T) {
 
 func TestCodecPlan(t *testing.T) {
 	// av1 video is outside the good list -> transcode video only.
-	p := codecPlan(&probe.MediaInfo{VideoCodec: "av1", AudioCodec: "aac"}, false)
+	p := codecPlan(&probe.MediaInfo{VideoCodec: "av1", AudioCodec: "aac"}, false, 0)
 	if p.Kind != TranscodeCodec || !p.Video || p.Audio {
 		t.Fatalf("av1/aac: %+v", p)
 	}
 	// All good -> none.
-	p = codecPlan(&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "aac"}, false)
+	p = codecPlan(&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "aac"}, false, 0)
 	if p.Kind != TranscodeNone {
 		t.Fatalf("h264/aac should not transcode: %+v", p)
 	}
 	// Forced -> both.
-	p = codecPlan(&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "aac"}, true)
+	p = codecPlan(&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "aac"}, true, 0)
 	if p.Kind != TranscodeCodec || !p.Video || !p.Audio {
 		t.Fatalf("forced: %+v", p)
 	}
@@ -816,7 +821,7 @@ func TestSoftSubOffsetFollowsTranscode(t *testing.T) {
 	s := &fakeServer{}
 	media := &renderer.Media{}
 	_, build, resoft, err := a.buildDelivery(s, media, "/x/movie.mkv", t.TempDir(),
-		&probe.MediaInfo{VideoCodec: "av1", AudioCodec: "eac3"}, soft, false, 85*time.Second)
+		&probe.MediaInfo{VideoCodec: "av1", AudioCodec: "eac3"}, soft, 0, false, 85*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -833,7 +838,7 @@ func TestSoftSubOffsetFollowsTranscode(t *testing.T) {
 	// h264 => direct-play; the sidecar must be served as-is.
 	s2 := &fakeServer{}
 	_, build2, _, err := a.buildDelivery(s2, &renderer.Media{}, "/x/movie.mkv", t.TempDir(),
-		&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "eac3"}, soft, false, 85*time.Second)
+		&probe.MediaInfo{VideoCodec: "h264", AudioCodec: "eac3"}, soft, 0, false, 85*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

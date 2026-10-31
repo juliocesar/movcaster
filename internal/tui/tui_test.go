@@ -56,14 +56,14 @@ func TestSubMenuOpensOnActive(t *testing.T) {
 	m := model{ctrl: f, prog: newTestProgress()}
 	mi, _ := m.Update(keyRune('s'))
 	m = mi.(model)
-	if !m.subMenuOpen {
+	if !m.menuOpen {
 		t.Fatal("s did not open the menu")
 	}
-	if m.subCursor != 1 {
-		t.Fatalf("cursor = %d, want active index 1", m.subCursor)
+	if m.menuCursor != 1 {
+		t.Fatalf("cursor = %d, want active index 1", m.menuCursor)
 	}
-	if len(m.subChoices) != 3 {
-		t.Fatalf("choices = %v", m.subChoices)
+	if len(m.menuChoices) != 3 {
+		t.Fatalf("choices = %v", m.menuChoices)
 	}
 }
 
@@ -72,38 +72,38 @@ func TestSubMenuPlainControllerDoesNotOpen(t *testing.T) {
 	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress()}
 	mi, _ := m.Update(keyRune('s'))
 	m = mi.(model)
-	if m.subMenuOpen {
+	if m.menuOpen {
 		t.Fatal("menu opened for a controller without subtitle support")
 	}
 }
 
 func TestSubMenuNavigationBounds(t *testing.T) {
 	f := &fakeSubCtrl{choices: []string{"A", "B", "Off"}, active: 0}
-	m := model{ctrl: f, prog: newTestProgress(), subMenuOpen: true, subChoices: f.choices, subCursor: 0}
+	m := model{ctrl: f, prog: newTestProgress(), menuOpen: true, menuChoices: f.choices, menuCursor: 0}
 
 	// Up at the top stays put.
 	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
 	m = mi.(model)
-	if m.subCursor != 0 {
-		t.Fatalf("cursor went above 0: %d", m.subCursor)
+	if m.menuCursor != 0 {
+		t.Fatalf("cursor went above 0: %d", m.menuCursor)
 	}
 	// Down moves; down at the bottom clamps.
 	for i := 0; i < 5; i++ {
 		mi, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
 		m = mi.(model)
 	}
-	if m.subCursor != 2 {
-		t.Fatalf("cursor = %d, want clamped to 2", m.subCursor)
+	if m.menuCursor != 2 {
+		t.Fatalf("cursor = %d, want clamped to 2", m.menuCursor)
 	}
 }
 
 func TestSubMenuEnterSwitches(t *testing.T) {
 	f := &fakeSubCtrl{choices: []string{"A", "B", "Off"}, active: 0}
-	m := model{ctrl: f, prog: newTestProgress(), subMenuOpen: true, subChoices: f.choices, subCursor: 2}
+	m := model{ctrl: f, prog: newTestProgress(), menuOpen: true, menuChoices: f.choices, menuCursor: 2}
 
 	mi, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = mi.(model)
-	if m.subMenuOpen {
+	if m.menuOpen {
 		t.Fatal("menu should close on enter")
 	}
 	if !m.switching {
@@ -113,8 +113,8 @@ func TestSubMenuEnterSwitches(t *testing.T) {
 		t.Fatal("enter returned no switch command")
 	}
 	done := cmd()
-	if _, ok := done.(subDoneMsg); !ok {
-		t.Fatalf("expected subDoneMsg, got %T", done)
+	if _, ok := done.(switchDoneMsg); !ok {
+		t.Fatalf("expected switchDoneMsg, got %T", done)
 	}
 	if len(f.setCalls) != 1 || f.setCalls[0] != 2 {
 		t.Fatalf("SetSubtitle calls = %v, want [2]", f.setCalls)
@@ -124,7 +124,7 @@ func TestSubMenuEnterSwitches(t *testing.T) {
 func TestSubDoneRefreshesLabel(t *testing.T) {
 	f := &fakeSubCtrl{subInfo: "soft: movie.srt"}
 	m := model{ctrl: f, prog: newTestProgress(), switching: true, subInfo: "old"}
-	mi, _ := m.Update(subDoneMsg{})
+	mi, _ := m.Update(switchDoneMsg{})
 	m = mi.(model)
 	if m.switching {
 		t.Fatal("switching not cleared")
@@ -136,10 +136,10 @@ func TestSubDoneRefreshesLabel(t *testing.T) {
 
 func TestSubMenuEscCloses(t *testing.T) {
 	f := &fakeSubCtrl{choices: []string{"A", "Off"}}
-	m := model{ctrl: f, prog: newTestProgress(), subMenuOpen: true, subChoices: f.choices}
+	m := model{ctrl: f, prog: newTestProgress(), menuOpen: true, menuChoices: f.choices}
 	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = mi.(model)
-	if m.subMenuOpen {
+	if m.menuOpen {
 		t.Fatal("esc did not close the menu")
 	}
 	if len(f.setCalls) != 0 {
@@ -461,7 +461,7 @@ func TestSubMenuScrollsLongList(t *testing.T) {
 		prog: progress.New(progress.WithWidth(50))}
 	mi, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 	m = mi.(model)
-	if !m.subMenuOpen {
+	if !m.menuOpen {
 		t.Fatal("picker did not open")
 	}
 
@@ -475,8 +475,8 @@ func TestSubMenuScrollsLongList(t *testing.T) {
 	if rows >= len(choices) {
 		t.Errorf("drew %d rows of %d — the list is not windowed", rows, len(choices))
 	}
-	if rows > m.subVisibleRows() {
-		t.Errorf("drew %d rows, window is %d", rows, m.subVisibleRows())
+	if rows > m.menuVisibleRows() {
+		t.Errorf("drew %d rows, window is %d", rows, m.menuVisibleRows())
 	}
 	// The active track must be visible on open, not scrolled off.
 	if !strings.Contains(view, "Track s:30") {
@@ -509,8 +509,8 @@ func TestSubMenuJumpToEnd(t *testing.T) {
 	mi, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
 	m = mi.(model)
 
-	if m.subCursor != 43 {
-		t.Fatalf("cursor = %d, want 43", m.subCursor)
+	if m.menuCursor != 43 {
+		t.Fatalf("cursor = %d, want 43", m.menuCursor)
 	}
 	if !strings.Contains(m.View(), "> Off") {
 		t.Errorf("Off not visible after jumping to the end:\n%s", m.View())
@@ -533,14 +533,100 @@ func TestSubMenuPagingStaysInBounds(t *testing.T) {
 		mi, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
 		m = mi.(model)
 	}
-	if m.subCursor != 43 {
-		t.Errorf("paging down past the end: cursor = %d, want 43", m.subCursor)
+	if m.menuCursor != 43 {
+		t.Errorf("paging down past the end: cursor = %d, want 43", m.menuCursor)
 	}
 	for i := 0; i < 20; i++ {
 		mi, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
 		m = mi.(model)
 	}
-	if m.subCursor != 0 {
-		t.Errorf("paging up past the start: cursor = %d, want 0", m.subCursor)
+	if m.menuCursor != 0 {
+		t.Errorf("paging up past the start: cursor = %d, want 0", m.menuCursor)
+	}
+}
+
+// fakeAudioCtrl adds live audio switching (satisfies AudioController).
+type fakeAudioCtrl struct {
+	fakeCtrl
+	tracks    []string
+	active    int
+	setCalls  []int
+	audioInfo string
+}
+
+func (f *fakeAudioCtrl) AudioChoices() []string { return f.tracks }
+func (f *fakeAudioCtrl) ActiveAudio() int       { return f.active }
+func (f *fakeAudioCtrl) SetAudio(_ context.Context, idx int) error {
+	f.setCalls = append(f.setCalls, idx)
+	return nil
+}
+func (f *fakeAudioCtrl) AudioInfo() string { return f.audioInfo }
+
+func TestAudioMenuOpensAppliesAndRelabels(t *testing.T) {
+	f := &fakeAudioCtrl{tracks: []string{"a:0 — Spanish", "a:1 — English"}, active: 1}
+	m := model{ctrl: f, prog: newTestProgress(), height: 24}
+	mi, _ := m.Update(keyRune('a'))
+	m = mi.(model)
+	if !m.menuOpen || m.menuKind != pickAudio || m.menuCursor != 1 {
+		t.Fatalf("a: open=%v kind=%v cursor=%d", m.menuOpen, m.menuKind, m.menuCursor)
+	}
+	if v := m.View(); !strings.Contains(v, "Audio  (") || !strings.Contains(v, "a:1 — English   ● active") {
+		t.Fatalf("audio picker view:\n%s", v)
+	}
+
+	mi, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = mi.(model)
+	mi, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = mi.(model)
+	if m.menuOpen || !m.switching || m.switchKind != pickAudio || cmd == nil {
+		t.Fatalf("enter: open=%v switching=%v kind=%v", m.menuOpen, m.switching, m.switchKind)
+	}
+	if !strings.Contains(m.View(), "switching audio") {
+		t.Error("status line should say audio is switching")
+	}
+	if _, ok := cmd().(switchDoneMsg); !ok || len(f.setCalls) != 1 || f.setCalls[0] != 0 {
+		t.Fatalf("SetAudio calls = %v", f.setCalls)
+	}
+
+	f.audioInfo = "a:0 — Spanish"
+	mi, _ = m.Update(switchDoneMsg{})
+	m = mi.(model)
+	if m.switching || m.audioInfo != "a:0 — Spanish" {
+		t.Fatalf("after switch: switching=%v audioInfo=%q", m.switching, m.audioInfo)
+	}
+}
+
+func TestAudioMenuClosesOnItsOwnKey(t *testing.T) {
+	f := &fakeAudioCtrl{tracks: []string{"x", "y"}}
+	m := model{ctrl: f, prog: newTestProgress()}
+	mi, _ := m.Update(keyRune('a'))
+	mi, _ = mi.(model).Update(keyRune('s')) // the subtitle key does not close the audio picker
+	if !mi.(model).menuOpen {
+		t.Fatal("s closed the audio picker")
+	}
+	mi, _ = mi.(model).Update(keyRune('a'))
+	if mi.(model).menuOpen {
+		t.Fatal("a did not close the audio picker")
+	}
+}
+
+func TestAudioMenuNeedsTwoTracks(t *testing.T) {
+	for _, ctrl := range []Controller{&fakeCtrl{}, &fakeAudioCtrl{tracks: []string{"only"}}} {
+		m := model{ctrl: ctrl, prog: newTestProgress()}
+		mi, _ := m.Update(keyRune('a'))
+		if mi.(model).menuOpen {
+			t.Errorf("%T: a opened the picker with nothing to choose", ctrl)
+		}
+	}
+}
+
+func TestHeaderShowsAudioOnlyWhenSet(t *testing.T) {
+	m := model{ctrl: &fakeCtrl{}, prog: newTestProgress(), title: "t", audioInfo: "a:1 — English"}
+	if v := m.View(); !strings.Contains(v, "audio: a:1 — English") || !strings.Contains(v, "a audio") {
+		t.Fatalf("view:\n%s", v)
+	}
+	m.audioInfo = ""
+	if v := m.View(); strings.Contains(v, "audio:") || strings.Contains(v, "a audio") {
+		t.Fatalf("single-track view should not mention audio:\n%s", v)
 	}
 }

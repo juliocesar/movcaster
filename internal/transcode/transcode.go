@@ -19,28 +19,39 @@ var goodAudio = map[string]bool{
 	"aac": true, "ac3": true, "eac3": true, "mp3": true, "mp2": true, "dts": true, "flac": true,
 }
 
-// Needs reports whether the video and/or audio streams need transcoding.
-func Needs(mi *probe.MediaInfo) (video, audio bool) {
+// Needs reports whether the video and/or the chosen audio stream (a:audioTrack)
+// need transcoding. A file probed without per-track detail falls back to the
+// first audio stream's codec.
+func Needs(mi *probe.MediaInfo, audioTrack int) (video, audio bool) {
 	if mi == nil {
 		return false, false
 	}
 	if mi.VideoCodec != "" && !goodVideo[mi.VideoCodec] {
 		video = true
 	}
-	if mi.AudioCodec != "" && !goodAudio[mi.AudioCodec] {
+	codec := mi.AudioCodec
+	if audioTrack >= 0 && audioTrack < len(mi.Audio) {
+		codec = mi.Audio[audioTrack].Codec
+	}
+	if codec != "" && !goodAudio[codec] {
 		audio = true
 	}
 	return video, audio
 }
 
+// AudioMap is the -map selector for audio stream a:N. The trailing "?" keeps a
+// file with no audio at all castable.
+func AudioMap(audioTrack int) string { return fmt.Sprintf("0:a:%d?", audioTrack) }
+
 // Args builds ffmpeg args that transcode (or copy) into a fragmented MP4 on
-// stdout. ss is the absolute input-seek offset for seek-restart.
-func Args(input string, ss time.Duration, transcodeVideo, transcodeAudio bool) []string {
+// stdout. ss is the absolute input-seek offset for seek-restart; audioTrack is
+// the a:N stream to carry (the only audio in the output).
+func Args(input string, ss time.Duration, transcodeVideo, transcodeAudio bool, audioTrack int) []string {
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
 	if ss > 0 {
 		args = append(args, "-ss", fmt.Sprintf("%.3f", ss.Seconds()))
 	}
-	args = append(args, "-i", input, "-map", "0:v:0", "-map", "0:a:0?", "-dn", "-map_chapters", "-1")
+	args = append(args, "-i", input, "-map", "0:v:0", "-map", AudioMap(audioTrack), "-dn", "-map_chapters", "-1")
 
 	if transcodeVideo {
 		args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p")
