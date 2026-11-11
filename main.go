@@ -372,35 +372,41 @@ func runPlaylist(app *core.App, base core.CastRequest, path string) error {
 	return runCast(app, first, next, true)
 }
 
-// resumeFile returns the newest still-existing entry in the resume index. It
-// walks newest-first so a since-deleted file doesn't dead-end the resume; each
-// skipped entry is warned about. Errors when nothing playable remains.
+// resumeFile returns the most recently played video, or the next episode after
+// it when it has since been deleted (see availableOrNext).
 func resumeFile(rs *resume.Store) (string, error) {
-	for _, p := range rs.Recent() {
-		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
-			return p, nil
-		}
-		fmt.Fprintln(os.Stderr, "movcaster: skipping missing resume entry:", p)
+	recent := rs.Recent()
+	if len(recent) == 0 {
+		return "", fmt.Errorf("no recently played video to resume")
 	}
-	return "", fmt.Errorf("no recently played video to resume")
+	return availableOrNext(recent[0])
 }
 
 // resumeMatchFile returns the best fuzzy match for pattern among the played
-// videos, newest-first on ties (see resume.Rank). Since-deleted entries are
-// skipped (and warned about) so a stale index row doesn't dead-end the match.
-// Errors when nothing matches closely enough or no match still exists on disk.
+// videos, newest-first on ties (see resume.Rank), or the next episode after it
+// when it has since been deleted (see availableOrNext). Errors when nothing
+// matches closely enough.
 func resumeMatchFile(rs *resume.Store, pattern string) (string, error) {
 	matches := resume.Rank(pattern, rs.Recent())
 	if len(matches) == 0 {
 		return "", fmt.Errorf("no played video matches %q", pattern)
 	}
-	for _, p := range matches {
-		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
-			return p, nil
-		}
-		fmt.Fprintln(os.Stderr, "movcaster: skipping missing resume entry:", p)
+	return availableOrNext(matches[0])
+}
+
+// availableOrNext returns p when it still exists, else the next available
+// episode after it in the same directory (see nextep.Find), so deleting watched
+// episodes doesn't dead-end a resume. Older resume entries are deliberately not
+// considered, since they'd replay something already watched. Errors when
+// neither p nor a later episode exists.
+func availableOrNext(p string) (string, error) {
+	if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+		return p, nil
 	}
-	return "", fmt.Errorf("no played video matching %q still exists", pattern)
+	if next, ok, _ := nextep.Find(p); ok {
+		return next, nil
+	}
+	return "", fmt.Errorf("%s no longer exists and no later episode is available", filepath.Base(p))
 }
 
 // existingFiles drops entries that don't exist or aren't regular files, warning

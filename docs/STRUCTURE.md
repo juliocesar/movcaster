@@ -50,12 +50,14 @@ Thin CLI client: flag parsing + map to `core.CastRequest` + render events. No
 orchestration logic.
 - `main()` — flags: `-l -t -sub -no-subs -burn -soft -sub-track -audio-track -mux-soft -transcode -info`.
   Builds one `core.App` with an `OnEvent` reporter. `-no-next` disables auto-advance.
-  `-resume` (no file arg) casts the last played video via `resumeFile` (newest still-existing
-  entry from `resume.Store.Recent()`, skipping missing ones), then runs like a normal cast;
+  `-resume` (no file arg) casts the last played video via `resumeFile` (newest entry from
+  `resume.Store.Recent()`, or the next episode after it if deleted), then runs like a normal cast;
   mutually exclusive with a file arg and `--playlist`.
   `-resume-last <pattern>` (no file arg) fuzzy-matches `pattern` against the played videos'
-  base names via `resumeMatchFile` (→ `resume.Rank` over `Recent()`, newest-first on ties,
-  skipping since-deleted entries) and resumes the best match; mutually exclusive with a file
+  base names via `resumeMatchFile` (→ `resume.Rank` over `Recent()`, newest-first on ties)
+  and resumes the best match, or the next episode after it if deleted. Both go through
+  `availableOrNext` (→ `nextep.Find`, which only parses the name and lists the dir, so it
+  works on a deleted path); older entries are never used. Mutually exclusive with a file
   arg, `--playlist`, and `--resume`.
 - `report(Event)` — `Info`→stdout, `Warn`→stderr with the `movcaster:` prefix. Used
   outside a cast (`-l`, `--info`, "Resuming:", "Up next:"); during a cast the sink is

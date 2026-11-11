@@ -169,7 +169,8 @@ starts from the top.
 
 Don't remember which file you had on? `movcaster --resume` (no file argument)
 picks the most recently played video and continues it. If that file has since
-moved, it falls back to the next most recent. From there it behaves like a normal
+been deleted, it continues with the next episode still in the folder, and errors
+if there's none. From there it behaves like a normal
 cast, auto-advancing to the next episode on end unless you pass `--no-next`.
 
 Juggling a few shows at once? `movcaster --resume-last PATTERN` continues the most
@@ -177,7 +178,8 @@ recently played video whose name matches `PATTERN` instead of just the very last
 one. The match is fuzzy, not a regex — `movcaster --resume-last hannibal` finds
 `Hannibal S02E10 - Naka-Choko.mkv`. Case, punctuation, and word order don't
 matter, and a small typo is forgiven; an unrelated pattern that matches nothing
-closely just errors rather than casting something random.
+closely just errors rather than casting something random. Deleted files are
+handled the same way as with `--resume`.
 
 ## Next episode, automatically
 
