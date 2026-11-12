@@ -56,11 +56,6 @@ homebrew_casks:
     commit_author:
       name: goreleaser
       email: noreply@github.com
-    # Strip the macOS quarantine xattr so the downloaded binary runs without a
-    # Gatekeeper prompt.
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/movcaster"]
-          end
+    # No quarantine-stripping hook: Homebrew no longer quarantines cask
+    # downloads, and its `postflight` block (what hooks.post.install renders)
+    # is deprecated in favor of `postflight_steps`, which can't run xattr.
