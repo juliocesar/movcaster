@@ -11,6 +11,11 @@ import "github.com/juliocesar/movcaster/internal/engine"
 // (MKV, h264, E-AC-3) needs a container remux plus an audio transcode, and even
 // the best case (MKV, h264, AAC) needs the remux. The remux copies both
 // streams, so it costs no encoding.
+//
+// Real receivers can be far wider: a TCL C6K Google TV plays MKV, HEVC (incl.
+// 10-bit), AV1, AC-3/E-AC-3/DTS, 4K and 5.1 (see STRUCTURE.md). Keep this
+// default narrow anyway; that breadth belongs in the per-device override the
+// prober saves.
 var defaultReceiverProfile = engine.Profile{
 	Name:        "Default Media Receiver",
 	Containers:  set("mp4", "webm"),                          // NOT matroska

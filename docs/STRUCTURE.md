@@ -399,6 +399,22 @@ Cast-engine specific — all live in `internal/engine/googlecast`:
   screen; stop the media session only.
 - **Omit `activeTrackIds` entirely when there is no subtitle** — an empty array
   is not absence on some receivers.
+- **A receiver reports PLAYING before it has decoded anything** — an
+  undecodable stream goes PLAYING, then `ERROR detailedErrorCode 102`, then
+  IDLE. Judge playability by reaching FINISHED (the prober does), never by
+  PLAYING alone.
+- **MEDIA_STATUS lists no AUDIO track** (only TEXT/VIDEO, even for AAC), so
+  whether audio is actually heard cannot be read from the receiver; it is a
+  human check.
+- **Observed on a TCL C6K (Google TV, Android 14), 2026-11-16**: its Default
+  Media Receiver plays MKV, HEVC Main and Main 10, AV1, AC-3, E-AC-3, DTS, 4K
+  and 5.1 AAC (all probe clips to FINISHED). `SET_VOLUME` on the receiver
+  namespace drives the TV's master volume. Native SEEK on direct-play and
+  seek-restart on a LIVE pipe both land in ~1s; a live HEVC 10-bit → h264
+  burn-in keeps real time. Once the sender closes, the receiver app exits
+  (the next cast relaunches it, correctly). The same TV also runs a generic
+  DLNA renderer ("Windows Media Player", Platinum stack), which discovery
+  hides behind the Cast entry.
 
 ## Verification notes
 
