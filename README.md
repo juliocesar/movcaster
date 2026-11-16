@@ -100,11 +100,30 @@ movcaster "Hannibal S01E01.mkv"
 movcaster --playlist tonight.txt
 ```
 
-The first device you cast to is remembered (`~/.config/movcaster/config.json`),
-so plain `movcaster <file>` keeps finding your TV — even after it reboots and
-shuffles its DLNA port around. TVs of different families coexist: `-l` shows
-which engine (dlna, googlecast) owns each device, and `-t googlecast:<ip>`
-pins one explicitly.
+The first device you cast to is remembered (in `config.json` under
+`~/Library/Application Support/movcaster/` on macOS, `~/.config/movcaster/` on
+Linux), so plain `movcaster <file>` keeps finding your TV, even after it reboots
+and shuffles its DLNA port around. TVs of different families coexist: `-l` shows
+which engine (dlna, googlecast) owns each device, and `-t googlecast:<ip>` pins
+one explicitly. A TV that speaks both, like most Google TVs, is listed once,
+under Google Cast, with the other noted as `(also: dlna)`. Use `-t dlna:<ip>` if
+you ever want that path instead.
+
+### On a Google TV
+
+Run this once, with the TV on:
+
+```sh
+movcaster --probe-device
+```
+
+It plays a couple of minutes of short test clips on the TV to measure what it
+can play directly, then saves the result for that TV. Until you do, movcaster
+assumes only what every Chromecast plays, so MKV files, HEVC video and Dolby
+audio get converted on the fly instead of streamed as they are. After the probe,
+a TV that handles them (most recent Google TVs do) plays them untouched.
+Audio the TV can't play is converted to AAC, keeping 5.1 when the probe showed
+the TV plays 5.1.
 
 ### TUI controls
 
@@ -134,7 +153,7 @@ movcaster <file>                   cast (auto subtitles + auto codec fallback)
 movcaster <file> -t TARGET         target a device (IP, IP:port, engine:host, or device URL)
 movcaster <file> --engine NAME     restrict to one engine (dlna, googlecast)
 movcaster <file> --info            print streams + the chosen subtitle strategy
-movcaster --probe-device [-t T]    measure what a device actually plays
+movcaster --probe-device [-t T]    measure what a device actually plays, and save it
 movcaster <file> --sub foo.srt     force an explicit soft subtitle
 movcaster <file> --sub-track N     pick embedded subtitle track N (see --info)
 movcaster <file> --audio-track N   pick audio track N (default: English if present)
@@ -245,7 +264,7 @@ internal/probe           ffprobe wrapper + subtitle classification
 internal/subs            subtitle strategy + extract/burn/remux ffmpeg args
 internal/transcode       codec-compatibility transcode args
 internal/tui             bubbletea view layer
-internal/config          remembers the last device
+internal/config          remembers the last device and per-device profiles
 internal/resume          remembers playback position per file (~/.movcaster)
 internal/nextep          finds the next episode in the directory (auto-advance)
 internal/playlist        parses a playlist file (one video path per line)
