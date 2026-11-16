@@ -42,6 +42,9 @@ func applyOverride(p engine.Profile, o config.ProfileOverride) engine.Profile {
 	if o.MaxAudioChannels > 0 {
 		p.MaxAudioChannels = o.MaxAudioChannels
 	}
+	if o.TranscodeAudioChannels > 0 {
+		p.TranscodeAudioChannels = o.TranscodeAudioChannels
+	}
 	if p.Name != "" {
 		p.Name += ", device override"
 	}

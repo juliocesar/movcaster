@@ -69,7 +69,9 @@ engine's) or, with `-t`, `PrepareWithProfile` against the resolved device.
 - `Profile` — what a device actually plays: `Containers/VideoCodecs/AudioCodecs`
   sets (nil = anything), `MaxVideoHeight/MaxAudioChannels`, `SubFormats` in
   preference order (empty = no soft path, burn everything),
-  `HonorsStartAt`, `LoadStartsPlayback`, transcode targets.
+  `HonorsStartAt`, `LoadStartsPlayback`, transcode targets, and
+  `TranscodeAudioChannels` (most channels a re-encoded track keeps; 0 = stereo
+  until a probe shows the device plays multichannel AAC).
 - `registry.go` — `Register` (from `engine/all` inits), `Engines`, `Lookup`,
   `DiscoverAll` (concurrent, one engine's failure never blocks another),
   `ResolveTarget` (bare IP → try engines in order; `engine:host` prefix or
@@ -289,9 +291,13 @@ Serves `/media*` and `/subs*` (prefix routing — URLs carry ext + `?t=token`).
 - `Needs(mi, profile, audio) Plan{Video, Audio, Remux}` — per-axis check
   against the profile's sets + height/channel limits, judging the chosen a:N
   track's codec and channels; `Remux` = container mismatch only.
+  `AudioChannels` (with `Audio`) = the source's count capped by
+  `TranscodeAudioChannels` / `MaxAudioChannels`, stereo when unknown (never
+  upmixed). `ForceAll` is the `--transcode` plan.
 - `Args(input, ss, profile, plan, audio)` — fragmented MP4 on pipe with the
   profile's transcode targets, mapping only `AudioMap(a)` = `0:a:N?`; a
-  remux-only (or empty) plan copies both streams. Keeps
+  remux-only (or empty) plan copies both streams. Audio re-encodes at the
+  plan's channel count, 64 kb/s per channel above stereo. Keeps
   `+delay_moov` + `-use_editlist 0` (load-bearing; see gotchas) on every path.
 
 ### `internal/tui` — bubbletea view (thin)
@@ -311,8 +317,12 @@ Serves `/media*` and `/subs*` (prefix routing — URLs carry ext + `?t=token`).
   `os.UserConfigDir()/movcaster/config.json`. `LastDeviceEngine` empty (old
   config) = try every engine against the host — never fail on an old config.
   `DeviceProfiles` maps `"engine:host"` → `ProfileOverride{containers,
-  video_codecs, audio_codecs, max_video_height, max_audio_channels}` (non-empty
-  axes replace the engine default).
+  video_codecs, audio_codecs, max_video_height, max_audio_channels,
+  transcode_audio_channels}` (non-empty axes replace the engine default). The
+  probe sets `transcode_audio_channels: 6` when its 5.1 AAC clip played, so
+  Dolby/DTS tracks a Cast receiver refuses re-encode to 5.1 AAC, not stereo.
+  Burn-in (`subs.BurnArgs`) still re-encodes audio to stereo AAC on every
+  engine.
 
 ### `internal/resume`, `internal/nextep`, `internal/playlist`
 Unchanged: playback-position persistence + fuzzy `--resume-last` ranking;

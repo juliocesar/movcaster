@@ -16,6 +16,10 @@ type Plan struct {
 	Video bool // re-encode the video stream
 	Audio bool // re-encode the audio stream
 	Remux bool // container mismatch only: streams can be copied
+
+	// AudioChannels is the re-encoded audio's channel count (with Audio): the
+	// source's, capped by the profile. 0 when unknown, which means stereo.
+	AudioChannels int
 }
 
 // Needed reports whether the file cannot be direct-played as is.
@@ -36,10 +40,7 @@ func Needs(mi *probe.MediaInfo, p engine.Profile, audioTrack int) Plan {
 	if p.MaxVideoHeight > 0 && mi.Height > p.MaxVideoHeight {
 		plan.Video = true
 	}
-	codec, channels := mi.AudioCodec, mi.AudioChannels
-	if audioTrack >= 0 && audioTrack < len(mi.Audio) {
-		codec, channels = mi.Audio[audioTrack].Codec, mi.Audio[audioTrack].Channels
-	}
+	codec, channels := chosenAudio(mi, audioTrack)
 	if codec != "" && p.AudioCodecs != nil && !p.AudioCodecs[codec] {
 		plan.Audio = true
 	}
@@ -49,7 +50,63 @@ func Needs(mi *probe.MediaInfo, p engine.Profile, audioTrack int) Plan {
 	if mi.Container != "" && p.Containers != nil && !p.Containers[mi.Container] {
 		plan.Remux = true
 	}
+	if plan.Audio {
+		plan.AudioChannels = reencodeChannels(channels, p)
+	}
 	return plan
+}
+
+// ForceAll is Needs with every stream re-encoded (--transcode).
+func ForceAll(mi *probe.MediaInfo, p engine.Profile, audioTrack int) Plan {
+	plan := Needs(mi, p, audioTrack)
+	plan.Video, plan.Audio = true, true
+	var channels int
+	if mi != nil {
+		_, channels = chosenAudio(mi, audioTrack)
+	}
+	plan.AudioChannels = reencodeChannels(channels, p)
+	return plan
+}
+
+// chosenAudio is the codec and channel count of a:audioTrack, falling back to
+// the first audio stream's for a file probed without per-track detail.
+func chosenAudio(mi *probe.MediaInfo, audioTrack int) (codec string, channels int) {
+	if audioTrack >= 0 && audioTrack < len(mi.Audio) {
+		return mi.Audio[audioTrack].Codec, mi.Audio[audioTrack].Channels
+	}
+	return mi.AudioCodec, mi.AudioChannels
+}
+
+// reencodeChannels is how many channels a re-encoded track keeps: the source's,
+// capped by the profile's TranscodeAudioChannels (0 = stereo) and its
+// MaxAudioChannels limit. An unknown source count yields stereo.
+func reencodeChannels(src int, p engine.Profile) int {
+	limit := p.TranscodeAudioChannels
+	if limit <= 0 {
+		limit = 2
+	}
+	if p.MaxAudioChannels > 0 && p.MaxAudioChannels < limit {
+		limit = p.MaxAudioChannels
+	}
+	if src <= 0 {
+		src = 2 // unknown: never guess surround
+	}
+	return min(src, limit)
+}
+
+// audioArgs is the audio re-encode: the profile's codec at the plan's channel
+// count, with a bitrate that scales with it (192k is fine for stereo, thin for
+// 5.1).
+func audioArgs(p engine.Profile, plan Plan) []string {
+	ch := plan.AudioChannels
+	if ch <= 0 {
+		ch = 2
+	}
+	bitrate := "192k"
+	if ch > 2 {
+		bitrate = fmt.Sprintf("%dk", 64*ch)
+	}
+	return []string{"-c:a", audioCodec(p), "-b:a", bitrate, "-ac", fmt.Sprint(ch)}
 }
 
 // AudioMap is the -map selector for audio stream a:N. The trailing "?" keeps a
@@ -78,7 +135,7 @@ func Args(input string, ss time.Duration, p engine.Profile, plan Plan, audioTrac
 		args = append(args, "-c:v", "copy")
 	}
 	if plan.Audio {
-		args = append(args, "-c:a", audioCodec(p), "-b:a", "192k", "-ac", "2")
+		args = append(args, audioArgs(p, plan)...)
 	} else {
 		args = append(args, "-c:a", "copy")
 	}

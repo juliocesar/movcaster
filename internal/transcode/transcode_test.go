@@ -1,6 +1,7 @@
 package transcode
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -188,5 +189,45 @@ func TestArgsMapsChosenAudioTrack(t *testing.T) {
 	got := strings.Join(Args("in.mkv", 0, webOS, Plan{Remux: true}, 1), " ")
 	if !strings.Contains(got, "-map 0:a:1?") || strings.Contains(got, "0:a:0") {
 		t.Errorf("want only -map 0:a:1?, got %s", got)
+	}
+}
+
+// A re-encoded track keeps its surround only where the profile allows it:
+// stereo by default (the LG's long-standing behavior), up to 5.1 on a device
+// whose probe played a 5.1 AAC clip, and never more channels than the source.
+func TestReencodeChannels(t *testing.T) {
+	eac3 := func(ch int) *probe.MediaInfo {
+		return &probe.MediaInfo{Container: "mp4", VideoCodec: "h264", AudioCodec: "eac3", AudioChannels: ch}
+	}
+	surround := cast
+	surround.TranscodeAudioChannels = 6
+	cases := []struct {
+		name string
+		mi   *probe.MediaInfo
+		p    engine.Profile
+		want int
+	}{
+		{"default profile downmixes 5.1", eac3(6), cast, 2},
+		{"surround profile keeps 5.1", eac3(6), surround, 6},
+		{"surround profile caps 7.1 at 5.1", eac3(8), surround, 6},
+		{"surround profile never upmixes stereo", eac3(2), surround, 2},
+		{"unknown source channels is stereo", eac3(0), surround, 2},
+		{"a channel limit wins", eac3(6), engine.Profile{AudioCodecs: set("aac"), TranscodeAudioChannels: 6, MaxAudioChannels: 2}, 2},
+	}
+	for _, c := range cases {
+		plan := Needs(c.mi, c.p, 0)
+		if !plan.Audio || plan.AudioChannels != c.want {
+			t.Errorf("%s: plan = %+v, want audio re-encode at %d channels", c.name, plan, c.want)
+		}
+		args := strings.Join(Args("in.mkv", 0, c.p, plan, 0), " ")
+		if !strings.Contains(args, fmt.Sprintf("-ac %d", c.want)) {
+			t.Errorf("%s: args %s, want -ac %d", c.name, args, c.want)
+		}
+	}
+	if got := strings.Join(Args("in.mkv", 0, surround, Needs(eac3(6), surround, 0), 0), " "); !strings.Contains(got, "-b:a 384k") {
+		t.Errorf("5.1 AAC should get a 384k bitrate: %s", got)
+	}
+	if got := ForceAll(eac3(6), surround, 0); !got.Video || !got.Audio || got.AudioChannels != 6 {
+		t.Errorf("ForceAll = %+v, want everything re-encoded at 6 channels", got)
 	}
 }

@@ -95,6 +95,23 @@ func TestDeriveOverride(t *testing.T) {
 	if o.MaxAudioChannels != 0 {
 		t.Fatalf("passed 5.1 probe must not cap channels: %d", o.MaxAudioChannels)
 	}
+	if o.TranscodeAudioChannels != 6 {
+		t.Fatalf("passed 5.1 AAC probe must let re-encodes keep 5.1: %d", o.TranscodeAudioChannels)
+	}
+
+	// A failed 5.1 probe caps channels and keeps re-encodes stereo.
+	for i, clip := range probeMatrix {
+		if clip.channels == 6 {
+			outcomes[i].Played = false
+		}
+	}
+	o = deriveOverride(outcomes)
+	if o.MaxAudioChannels != 2 || o.TranscodeAudioChannels != 0 {
+		t.Fatalf("failed 5.1 probe: max=%d transcode=%d, want 2 and 0", o.MaxAudioChannels, o.TranscodeAudioChannels)
+	}
+	if p := applyOverride(engine.Profile{}, config.ProfileOverride{TranscodeAudioChannels: 6}); p.TranscodeAudioChannels != 6 {
+		t.Fatalf("override must carry transcode_audio_channels, got %d", p.TranscodeAudioChannels)
+	}
 }
 
 func contains(list []string, s string) bool {

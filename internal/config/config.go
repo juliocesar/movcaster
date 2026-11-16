@@ -29,6 +29,9 @@ type ProfileOverride struct {
 	AudioCodecs      []string `json:"audio_codecs,omitempty"`
 	MaxVideoHeight   int      `json:"max_video_height,omitempty"`
 	MaxAudioChannels int      `json:"max_audio_channels,omitempty"`
+	// TranscodeAudioChannels lets a re-encoded audio track keep up to this many
+	// channels (5.1 = 6) instead of the stereo default.
+	TranscodeAudioChannels int `json:"transcode_audio_channels,omitempty"`
 }
 
 func path() (string, error) {

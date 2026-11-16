@@ -39,6 +39,12 @@ type Profile struct {
 	TranscodeVideo     string // "libx264"
 	TranscodeAudio     string // "aac"
 	TranscodeContainer string // "mp4"
+
+	// TranscodeAudioChannels is the most channels a re-encoded audio track
+	// keeps (never more than the source has). 0 means stereo: a downmix is the
+	// safe default until --probe-device shows the device plays multichannel
+	// TranscodeAudio, since a device may refuse what it cannot decode.
+	TranscodeAudioChannels int
 }
 
 // SoftSubFormat is the preferred soft-subtitle format, or SubFormatNone when the

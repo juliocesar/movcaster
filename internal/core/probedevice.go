@@ -295,8 +295,14 @@ func deriveOverride(outcomes []ProbeOutcome) config.ProfileOverride {
 		if clip.size == "3840x2160" && !out.Played && out.Skipped == "" && baselinePlayed {
 			o.MaxVideoHeight = 1080
 		}
-		if clip.channels == 6 && !out.Played && out.Skipped == "" && baselinePlayed {
-			o.MaxAudioChannels = 2
+		if clip.channels == 6 && out.Skipped == "" && baselinePlayed {
+			if out.Played {
+				// The clip is 5.1 AAC, exactly what a surround re-encode produces,
+				// so re-encodes may keep 5.1 instead of downmixing to stereo.
+				o.TranscodeAudioChannels = 6
+			} else {
+				o.MaxAudioChannels = 2
+			}
 		}
 	}
 	o.Containers = sortedKeys(containers)

@@ -79,6 +79,8 @@ type TranscodePlan struct {
 	Audio      bool // codec: re-encode audio
 	Remux      bool // container mismatch (streams may still be copied)
 	AudioTrack int  // the a:N stream the output carries
+	// AudioChannels is the re-encoded audio's channel count (with Audio).
+	AudioChannels int
 }
 
 // Preparation is the result of planning a cast: probe + subtitle strategy. It
@@ -291,7 +293,7 @@ func (p *Preparation) DescribeCodec() string {
 			if p.Codec.AudioTrack < len(p.Info.Audio) {
 				codec = p.Info.Audio[p.Codec.AudioTrack].Codec
 			}
-			what = append(what, "audio "+codec)
+			what = append(what, fmt.Sprintf("audio %s (-> %s)", codec, channelLayout(p.Codec.AudioChannels)))
 		}
 		if p.Codec.Remux {
 			what = append(what, "container "+p.Info.Container)
@@ -314,11 +316,12 @@ func (p *Preparation) DescribeCodec() string {
 func codecPlan(info *probe.MediaInfo, prof engine.Profile, force bool, audio int) TranscodePlan {
 	plan := transcode.Needs(info, prof, audio)
 	if force {
-		plan.Video, plan.Audio = true, true
+		plan = transcode.ForceAll(info, prof, audio)
 	}
 	switch {
 	case plan.Video || plan.Audio:
-		return TranscodePlan{Kind: TranscodeCodec, Video: plan.Video, Audio: plan.Audio, Remux: plan.Remux, AudioTrack: audio}
+		return TranscodePlan{Kind: TranscodeCodec, Video: plan.Video, Audio: plan.Audio, Remux: plan.Remux,
+			AudioTrack: audio, AudioChannels: plan.AudioChannels}
 	case plan.Remux || !directPlaysAudio(info):
 		return TranscodePlan{Kind: TranscodeRemux, Remux: plan.Remux, AudioTrack: audio}
 	default:
@@ -328,5 +331,5 @@ func codecPlan(info *probe.MediaInfo, prof engine.Profile, force bool, audio int
 
 // plan converts back to the transcode package's shape for Args.
 func (p TranscodePlan) plan() transcode.Plan {
-	return transcode.Plan{Video: p.Video, Audio: p.Audio, Remux: p.Remux}
+	return transcode.Plan{Video: p.Video, Audio: p.Audio, Remux: p.Remux, AudioChannels: p.AudioChannels}
 }
