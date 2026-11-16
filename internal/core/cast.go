@@ -380,7 +380,9 @@ func (a *App) Start(ctx context.Context, req CastRequest) (*Cast, *Preparation, 
 	a.emit(Info, "Casting to %s [%s]", dev.Name(), dev.Addr())
 
 	// Remember this device so a future bare `movcaster <file>` finds it again.
-	_ = a.store.Save(config.Config{LastDeviceHost: dev.Host(), LastDeviceEngine: dev.Engine()})
+	a.updateConfig(func(c *config.Config) {
+		c.LastDeviceHost, c.LastDeviceEngine = dev.Host(), dev.Engine()
+	})
 
 	prof := a.DeviceProfile(dev)
 	prep, err := a.PrepareWithProfile(ctx, req, prof, dev.Engine())

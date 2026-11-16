@@ -124,3 +124,33 @@ func TestSubFormat(t *testing.T) {
 		t.Fatal("preference order")
 	}
 }
+
+type hostDevice struct{ name, host, engine string }
+
+func (d hostDevice) Name() string                          { return d.name }
+func (d hostDevice) Host() string                          { return d.host }
+func (d hostDevice) Addr() string                          { return d.host + ":1" }
+func (d hostDevice) Engine() string                        { return d.engine }
+func (d hostDevice) Profile() Profile                      { return Profile{} }
+func (d hostDevice) Open(context.Context) (Session, error) { return nil, ErrNotThisEngine }
+
+// A TV answering on two engines shows up once, under the engine registered
+// first, whichever order discovery returned them in; other TVs are untouched.
+func TestPreferredPerHost(t *testing.T) {
+	withRegistry(t, fakeEngine{name: "native"}, fakeEngine{name: "generic"})
+	devs := []Device{
+		hostDevice{"TCL generic", "10.0.0.2", "generic"},
+		hostDevice{"LG", "10.0.0.3", "generic"},
+		hostDevice{"TCL native", "10.0.0.2", "native"},
+	}
+	kept, also := PreferredPerHost(devs)
+	if len(kept) != 2 || kept[0].Name() != "TCL native" || kept[1].Name() != "LG" {
+		t.Fatalf("kept = %v", kept)
+	}
+	if got := also["10.0.0.2"]; len(got) != 1 || got[0] != "generic" {
+		t.Fatalf("also[TCL] = %v", got)
+	}
+	if len(also["10.0.0.3"]) != 0 {
+		t.Fatalf("also[LG] = %v", also["10.0.0.3"])
+	}
+}

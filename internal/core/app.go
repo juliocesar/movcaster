@@ -150,8 +150,24 @@ func brewFormulaFromError(output string) string {
 
 // ListDevices discovers renderers on the LAN across every registered engine
 // (or just one, when only is non-empty).
-func (a *App) ListDevices(ctx context.Context, only string) ([]engine.Device, error) {
-	return a.finder.Discover(ctx, only)
+func (a *App) ListDevices(ctx context.Context, only string) ([]ListedDevice, error) {
+	devices, err := a.finder.Discover(ctx, only)
+	if err != nil {
+		return nil, err
+	}
+	kept, also := engine.PreferredPerHost(devices)
+	out := make([]ListedDevice, len(kept))
+	for i, d := range kept {
+		out[i] = ListedDevice{Device: d, Also: also[d.Host()]}
+	}
+	return out, nil
+}
+
+// ListedDevice is one TV in a listing: the device under its preferred engine,
+// plus the other engines that also answered for the same host.
+type ListedDevice struct {
+	engine.Device
+	Also []string
 }
 
 // ResolveDevice resolves an explicit target to a device (used by --info -t and
@@ -183,11 +199,12 @@ func (a *App) selectDevice(ctx context.Context, target, only string) (engine.Dev
 	devices, derr := a.finder.Discover(qctx, only)
 	cancel()
 	if derr == nil {
-		if d := a.pickDevice(devices); d != nil {
+		d, n := a.pickDevice(devices)
+		if d != nil {
 			return d, nil
 		}
-		if len(devices) > 1 {
-			return nil, fmt.Errorf("%d renderers found; pick one with -t (run -l to list)", len(devices))
+		if n > 1 {
+			return nil, fmt.Errorf("%d TVs found; pick one with -t (run -l to list)", n)
 		}
 	}
 
@@ -196,28 +213,35 @@ func (a *App) selectDevice(ctx context.Context, target, only string) (engine.Dev
 	return a.waitForDevice(ctx, deepDiscover, only)
 }
 
-// pickDevice returns the device to use from a discovery result: the saved
-// device if present, else the sole device. Returns nil when the choice is
-// ambiguous (multiple, none saved) or empty. A saved engine narrows the match
-// (two engines can expose the same host); an old config without one matches by
-// host alone, exactly like the single-engine days.
-func (a *App) pickDevice(devices []engine.Device) engine.Device {
+// pickDevice returns the device to use from a discovery result, and how many
+// distinct TVs it holds. A TV answering on several engines counts once, under
+// its preferred engine (engine.PreferredPerHost). The saved device wins: an
+// exact host + engine match first (so a TV deliberately cast to through a
+// secondary engine, e.g. -t dlna:host, keeps it), else the saved host under its
+// preferred engine (an old config without an engine, or a saved engine that
+// didn't answer this time). Otherwise the sole TV, or nil when the choice is
+// ambiguous or empty.
+func (a *App) pickDevice(devices []engine.Device) (engine.Device, int) {
 	cfg := a.store.Load()
+	kept, _ := engine.PreferredPerHost(devices)
 	if saved := cfg.LastDeviceHost; saved != "" {
-		for _, d := range devices {
-			if d.Host() != saved {
-				continue
+		if cfg.LastDeviceEngine != "" {
+			for _, d := range devices {
+				if d.Host() == saved && d.Engine() == cfg.LastDeviceEngine {
+					return d, len(kept)
+				}
 			}
-			if cfg.LastDeviceEngine != "" && d.Engine() != cfg.LastDeviceEngine {
-				continue
+		}
+		for _, d := range kept {
+			if d.Host() == saved {
+				return d, len(kept)
 			}
-			return d
 		}
 	}
-	if len(devices) == 1 {
-		return devices[0]
+	if len(kept) == 1 {
+		return kept[0], 1
 	}
-	return nil
+	return nil, len(kept)
 }
 
 // waitForDevice repeatedly discovers until a usable renderer appears or budget
@@ -229,11 +253,12 @@ func (a *App) waitForDevice(ctx context.Context, budget time.Duration, only stri
 	for {
 		devices, err := a.finder.Discover(dctx, only)
 		if err == nil {
-			if d := a.pickDevice(devices); d != nil {
+			d, n := a.pickDevice(devices)
+			if d != nil {
 				return d, nil
 			}
-			if len(devices) > 1 {
-				return nil, fmt.Errorf("%d renderers found; pick one with -t (run -l to list)", len(devices))
+			if n > 1 {
+				return nil, fmt.Errorf("%d TVs found; pick one with -t (run -l to list)", n)
 			}
 		}
 		// A saved TV that's slow to answer broadcasts (common right after wake)
@@ -266,7 +291,8 @@ func (a *App) selectTarget(ctx context.Context, target, only string) (engine.Dev
 	qctx, cancel := context.WithTimeout(ctx, quickDiscover)
 	devices, _ := a.finder.Discover(qctx, only)
 	cancel()
-	for _, d := range devices {
+	kept, _ := engine.PreferredPerHost(devices)
+	for _, d := range kept {
 		if wantHost != "" && d.Host() == wantHost {
 			return d, nil
 		}

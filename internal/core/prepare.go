@@ -96,22 +96,34 @@ type Preparation struct {
 	DecideErr   error            // strategy error (e.g. --soft on bitmap, unknown --audio-track)
 }
 
-// Prepare probes the file and decides the subtitle strategy against a default
-// profile (the first registered engine's, so `--info` without -t reports what a
-// bare cast would most likely do). It performs no network or TV I/O; use
-// PrepareWithProfile when a real device's profile is known.
+// Prepare probes the file and decides the subtitle strategy against the
+// profile a bare cast would most likely use: the last-used TV's (its engine's
+// default plus any probed override from the config), else the first registered
+// engine's. It performs no network or TV I/O; use PrepareWithProfile when a
+// real device's profile is known.
 func (a *App) Prepare(ctx context.Context, req CastRequest) (*Preparation, error) {
-	prof, name := planningProfile(req.Engine)
+	prof, name := a.planningProfile(req.Engine)
 	return a.PrepareWithProfile(ctx, req, prof, name)
 }
 
 // planningProfile picks the profile used when no device has been resolved: the
-// named engine's default, else the first registered engine's, else the built-in
-// webOS-shaped fallback (hermetic tests register no engines).
-func planningProfile(engineName string) (engine.Profile, string) {
+// named engine's default, else the saved last device's engine (with its config
+// override), else the first registered engine's, else the built-in webOS-shaped
+// fallback (hermetic tests register no engines).
+func (a *App) planningProfile(engineName string) (engine.Profile, string) {
+	cfg := a.store.Load()
+	if engineName == "" {
+		engineName = cfg.LastDeviceEngine
+	}
 	if engineName != "" {
 		if e, ok := engine.Lookup(engineName); ok {
-			return e.DefaultProfile(), e.Name()
+			prof := e.DefaultProfile()
+			if engineName == cfg.LastDeviceEngine {
+				if o, ok := cfg.DeviceProfiles[engineName+":"+cfg.LastDeviceHost]; ok {
+					prof = applyOverride(prof, o)
+				}
+			}
+			return prof, e.Name()
 		}
 	}
 	if es := engine.Engines(); len(es) > 0 {

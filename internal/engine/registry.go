@@ -124,3 +124,39 @@ func engineNames() string {
 	}
 	return strings.Join(names, ", ")
 }
+
+// Rank is an engine's registration index: lower is preferred when one TV
+// answers on several engines. Unknown engines rank last.
+func Rank(name string) int {
+	for i, e := range registry {
+		if e.Name() == name {
+			return i
+		}
+	}
+	return len(registry)
+}
+
+// PreferredPerHost collapses devices that share a host (one TV speaking several
+// protocols, e.g. a Google TV that also runs a DLNA renderer) to the one whose
+// engine ranks first, so each TV shows up once. also maps each kept device's
+// Host to the other engines that answered for it. Order follows each host's
+// first appearance.
+func PreferredPerHost(devices []Device) (kept []Device, also map[string][]string) {
+	idx := map[string]int{}
+	also = map[string][]string{}
+	for _, d := range devices {
+		i, seen := idx[d.Host()]
+		if !seen {
+			idx[d.Host()] = len(kept)
+			kept = append(kept, d)
+			continue
+		}
+		if Rank(d.Engine()) < Rank(kept[i].Engine()) {
+			also[d.Host()] = append(also[d.Host()], kept[i].Engine())
+			kept[i] = d
+		} else {
+			also[d.Host()] = append(also[d.Host()], d.Engine())
+		}
+	}
+	return kept, also
+}

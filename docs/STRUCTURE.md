@@ -73,7 +73,10 @@ engine's) or, with `-t`, `PrepareWithProfile` against the resolved device.
 - `registry.go` — `Register` (from `engine/all` inits), `Engines`, `Lookup`,
   `DiscoverAll` (concurrent, one engine's failure never blocks another),
   `ResolveTarget` (bare IP → try engines in order; `engine:host` prefix or
-  `only` restricts), `SplitTarget`.
+  `only` restricts), `SplitTarget`. `Rank` + `PreferredPerHost` collapse a TV
+  that answers on several engines (a Google TV also runs a generic DLNA
+  renderer) to its earliest-registered engine, so each TV is listed and picked
+  once; `DiscoverAll` itself still returns every entry.
 
 ### `internal/engine/dlna` — the DLNA/webOS engine
 - `discover.go` — SSDP. `searchTargets` merging (AVTransport URN + MediaRenderer
@@ -135,7 +138,9 @@ engine's) or, with `-t`, `PrepareWithProfile` against the resolved device.
 
 ### `internal/engine/all` — registration
 One `init()` with one `engine.Register` line per engine. `main` imports it
-blank. Adding a TV family = new package + one line here.
+blank. Adding a TV family = new package + one line here. **Order is
+preference**: googlecast before dlna, since DLNA is the extra many TVs expose;
+`-t dlna:<ip>` / `--engine dlna` still reach it explicitly.
 
 ### `internal/engine/enginetest` — conformance + architecture
 - `Run(t, e, dev)` — the shared contract suite (cancelled-ctx discovery,
@@ -149,10 +154,11 @@ blank. Adding a TV family = new package + one line here.
 Thin CLI client. Flags: `-l -t --engine -sub -no-subs -burn -soft -sub-track
 -audio-track -mux-soft -transcode -info -probe-device -no-next -playlist -resume
 -resume-last`. `-t` accepts IP, IP:port, `engine:host`, or a device URL;
-`--engine` restricts discovery. `-l` prints `name [addr] (engine)`.
+`--engine` restricts discovery. `-l` prints `name [addr] (engine)`, one line
+per TV, with `(also: <engines>)` when the TV answered on others too.
 `--info [-t]` plans against the default or the resolved device's profile and
 prints a `-> profile:` line. `--probe-device [-t]` runs `core.ProbeDevice` and
-prints the JSON report + override. `-resume` / `-resume-last <pattern>` resume
+prints the JSON report + override (which core has already saved). `-resume` / `-resume-last <pattern>` resume
 the newest (or best fuzzy-matched) played video, or the next episode after it
 when it was deleted (`availableOrNext` → `nextep.Find`, which only parses the
 name and lists the dir); older history entries are never used. Everything else
@@ -163,13 +169,19 @@ as before (playlists, next-episode, event reporting).
   over `engine.Device`), `NewServer`, `Store`, `Resume`, `OnEvent`. Production
   defaults wire the engine registry + real impls.
 - `Doctor(ctx)` — ffmpeg/ffprobe present *and* runnable.
-- `selectDevice(target, only)` — quick discovery pass → saved (host + engine)
-  or sole device; else "Looking for a TV..." + `waitForDevice` (retries + a
+- `selectDevice(target, only)` — quick discovery pass → `pickDevice`: saved
+  host + engine exactly, else the saved host under its preferred engine, else
+  the sole TV (multi-engine TVs count once); else "Looking for a TV..." + `waitForDevice` (retries + a
   direct Resolve of the saved host, which survives dropped multicast).
-  `selectTarget`: match discovered by host IP first, else `finder.Resolve`.
+  `selectTarget`: match discovered (preferred per host) by host IP first, else
+  `finder.Resolve`. `ListDevices` → `[]ListedDevice{Device, Also}`.
 - `DeviceProfile(dev)` (deviceprofile.go) — engine default merged with the
-  config `device_profiles["engine:host"]` override.
-- `Prepare` / `PrepareWithProfile` — pure planning: probe + `subs.Decide` +
+  config `device_profiles["engine:host"]` override. `updateConfig(edit)` is
+  the only config writer: load, edit, save, so remembering the last device
+  never erases probed profiles.
+- `Prepare` / `PrepareWithProfile` — pure planning (`Prepare` without a
+  device plans against the last-used TV's engine + saved override, else the
+  first registered engine): probe + `subs.Decide` +
   `selectAudio` + `codecPlan` against a profile. `Preparation{..., Audio,
   Profile, ProfileName}` + `Describe{Streams,Profile,Strategy,Audio,Codec}`. An
   unknown `--audio-track` lands in `DecideErr`.
@@ -221,8 +233,10 @@ as before (playlists, next-episode, event reporting).
   over a curated (container, video, audio) matrix + 4K + 5.1 limit probes,
   casts each, watches for `StatePlaying`/`StateFinished` (~8s), derives a
   `config.ProfileOverride` (axis supported when ANY tuple carrying it played;
-  a skipped clip — missing local encoder — says nothing). Honest about limits:
-  a test tone is not a real track.
+  a skipped clip — missing local encoder — says nothing) and saves it under
+  `device_profiles["engine:host"]` when at least one clip played (a run where
+  nothing played says nothing about the device). Honest about limits: a test
+  tone is not a real track.
 - `inhibitSleep()` (power_darwin.go) — `caffeinate -i` for the cast's lifetime.
 - `resumeOffset`, `hostOf`, `mimeForExt`, `clock`, `sleepCtx` helpers.
 

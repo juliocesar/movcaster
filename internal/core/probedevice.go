@@ -58,13 +58,14 @@ type ProbeOutcome struct {
 	Detail  string `json:"detail,omitempty"`  // load error / final state
 }
 
-// ProbeReport is what --probe-device prints: the raw outcomes plus a derived
-// ProfileOverride ready to paste into the config.
+// ProbeReport is what --probe-device prints: the raw outcomes plus the derived
+// ProfileOverride, which ProbeDevice also saves into the config for the device.
 type ProbeReport struct {
 	Device   string                 `json:"device"`
 	Key      string                 `json:"key"` // "engine:host" config key
 	Outcomes []ProbeOutcome         `json:"outcomes"`
 	Override config.ProfileOverride `json:"profile_override"`
+	Saved    bool                   `json:"-"` // Override was written to the config
 }
 
 // ProbeDevice generates small test clips, casts each at the target device, and
@@ -123,7 +124,28 @@ func (a *App) ProbeDevice(ctx context.Context, target, only string) (*ProbeRepor
 	cancel()
 
 	rep.Override = deriveOverride(rep.Outcomes)
+	// Save it as this device's profile, so later casts use it with no hand
+	// editing. A run where nothing played says nothing about the device (the
+	// network or the session broke), so it never replaces a saved profile.
+	if anyPlayed(rep.Outcomes) {
+		a.updateConfig(func(c *config.Config) {
+			if c.DeviceProfiles == nil {
+				c.DeviceProfiles = map[string]config.ProfileOverride{}
+			}
+			c.DeviceProfiles[rep.Key] = rep.Override
+		})
+		rep.Saved = true
+	}
 	return rep, nil
+}
+
+func anyPlayed(outcomes []ProbeOutcome) bool {
+	for _, o := range outcomes {
+		if o.Played {
+			return true
+		}
+	}
+	return false
 }
 
 // probeOne generates, serves, and watches one clip.

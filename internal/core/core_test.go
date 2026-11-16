@@ -198,6 +198,52 @@ func TestSelectDevicePrefersSavedEngine(t *testing.T) {
 	}
 }
 
+// One TV answering on two engines is one TV: with nothing saved it is picked
+// as the sole device, not reported as an ambiguous pair. A second TV makes it
+// ambiguous, and the error counts TVs, not engine entries.
+func TestSelectDeviceCollapsesMultiEngineTV(t *testing.T) {
+	gc := device("TCL (cast)", "10.0.0.5:8009")
+	gc.eng = "googlecast"
+	dl := device("TCL (dlna)", "10.0.0.5:16446")
+	a := New(Options{Finder: fakeFinder{devices: []engine.Device{gc, dl}}, Store: &fakeStore{}})
+	d, err := a.selectDevice(context.Background(), "", "")
+	if err != nil {
+		t.Fatalf("one TV on two engines must not be ambiguous: %v", err)
+	}
+	if d.Host() != "10.0.0.5" {
+		t.Fatalf("got %s", d.Host())
+	}
+
+	lg := device("LG", "10.0.0.9:1234")
+	a = New(Options{Finder: fakeFinder{devices: []engine.Device{gc, dl, lg}}, Store: &fakeStore{}})
+	_, err = a.selectDevice(context.Background(), "", "")
+	if err == nil || !strings.Contains(err.Error(), "2 TVs") {
+		t.Fatalf("want a 2-TV ambiguity error, got %v", err)
+	}
+
+	// -l lists each TV once and names the other engine.
+	listed, err := a.ListDevices(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 || len(listed[0].Also) != 1 || listed[0].Also[0] != "dlna" || len(listed[1].Also) != 0 {
+		t.Fatalf("listed = %+v", listed)
+	}
+}
+
+// Remembering the last device must not erase the probed device profiles.
+func TestUpdateConfigKeepsDeviceProfiles(t *testing.T) {
+	st := &fakeStore{cfg: config.Config{DeviceProfiles: map[string]config.ProfileOverride{
+		"googlecast:10.0.0.5": {VideoCodecs: []string{"h264", "hevc"}},
+	}}}
+	a := New(Options{Store: st})
+	a.updateConfig(func(c *config.Config) { c.LastDeviceHost, c.LastDeviceEngine = "10.0.0.5", "googlecast" })
+	got := st.saved[len(st.saved)-1]
+	if got.LastDeviceHost != "10.0.0.5" || len(got.DeviceProfiles["googlecast:10.0.0.5"].VideoCodecs) != 2 {
+		t.Fatalf("saved = %+v", got)
+	}
+}
+
 func TestSelectDeviceMultipleNoSavedErrors(t *testing.T) {
 	devs := []engine.Device{device("A", "10.0.0.5:1"), device("B", "10.0.0.9:2")}
 	a := New(Options{Finder: fakeFinder{devices: devs}, Store: &fakeStore{}})

@@ -23,7 +23,9 @@ new package plus one registration line, touching nothing in `core`, `subs`,
 3. Write a conservative `Profile` — only what the device family is *known* to
    play — then refine it per device with `movcaster --probe-device`. Guessing
    from a spec sheet produces silent black screens.
-4. Add `engine.Register(<name>.New())` to `internal/engine/all/all.go`.
+4. Add `engine.Register(<name>.New())` to `internal/engine/all/all.go`. Order
+   is preference when one TV answers on several engines (it is listed once,
+   under the first): put a native protocol ahead of DLNA.
 5. Add a package test calling `enginetest.Run` (with a faked device if you can
    build one in-process; the Cast engine's `fakereceiver_test.go` is the model).
 6. Nothing else. If you find yourself editing `core`, the abstraction has a

@@ -55,3 +55,12 @@ func listToSet(names []string) map[string]bool {
 	}
 	return m
 }
+
+// updateConfig applies edit to the stored config and saves it best-effort. It
+// always edits the loaded config rather than writing a fresh one, so saving the
+// last device keeps the probed device_profiles (and vice versa).
+func (a *App) updateConfig(edit func(*config.Config)) {
+	c := a.store.Load()
+	edit(&c)
+	_ = a.store.Save(c)
+}

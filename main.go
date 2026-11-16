@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/juliocesar/movcaster/internal/core"
@@ -249,8 +250,11 @@ func runList(app *core.App, only string) error {
 		extra := ""
 		// Volume control is an optional per-device capability some engines can
 		// tell without opening a session.
-		if hv, ok := d.(interface{ HasVolumeControl() bool }); ok && !hv.HasVolumeControl() {
+		if hv, ok := d.Device.(interface{ HasVolumeControl() bool }); ok && !hv.HasVolumeControl() {
 			extra = "  (no volume control)"
+		}
+		if len(d.Also) > 0 {
+			extra += "  (also: " + strings.Join(d.Also, ", ") + ")"
 		}
 		fmt.Printf("  %d. %s  [%s]  (%s)%s\n", i+1, d.Name(), d.Addr(), d.Engine(), extra)
 	}
@@ -306,7 +310,9 @@ func runProbeDevice(app *core.App, target, engine string) error {
 	fmt.Println()
 	fmt.Println(rep.MarshalReport())
 	fmt.Println()
-	fmt.Println("Paste profile_override under device_profiles[\"" + rep.Key + "\"] in the config to apply it.")
+	if rep.Saved {
+		fmt.Println("Saved as this TV's profile (device_profiles[\"" + rep.Key + "\"] in the config); casts to it use it from now on.")
+	}
 	fmt.Println("Caveat: a 4-second test clip proving a codec decodes does not prove a two-hour")
 	fmt.Println("4K file streams, and passthrough audio can differ between a test tone and a")
 	fmt.Println("real track. Verify with one real file.")
