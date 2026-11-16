@@ -17,7 +17,7 @@ func joined(args []string) string { return strings.Join(args, " ") }
 // both streams for the fragmented-MP4-from-0 stream the TV expects.
 func TestBurnArgsTextSeekKeepsSubtitlesAligned(t *testing.T) {
 	track := probe.SubTrack{SubIndex: 0, Codec: "subrip", Kind: probe.SubText}
-	got := joined(BurnArgs("in.mkv", track, 90*time.Second))
+	got := joined(BurnArgs("in.mkv", track, 0, 90*time.Second))
 
 	for _, want := range []string{"-ss 90.000", "-copyts", "setpts=PTS-STARTPTS", "-af asetpts=PTS-STARTPTS"} {
 		if !strings.Contains(got, want) {
@@ -34,7 +34,7 @@ func TestBurnArgsTextSeekKeepsSubtitlesAligned(t *testing.T) {
 // byte-for-byte as it was.
 func TestBurnArgsNoSeekUnchanged(t *testing.T) {
 	track := probe.SubTrack{SubIndex: 0, Codec: "subrip", Kind: probe.SubText}
-	got := joined(BurnArgs("in.mkv", track, 0))
+	got := joined(BurnArgs("in.mkv", track, 0, 0))
 	for _, unwanted := range []string{"-copyts", "setpts", "-ss"} {
 		if strings.Contains(got, unwanted) {
 			t.Errorf("ss=0 must not add %q: %s", unwanted, got)
@@ -50,7 +50,7 @@ func TestBurnArgsNoSeekUnchanged(t *testing.T) {
 // already works).
 func TestBurnArgsBitmapSeekUntouched(t *testing.T) {
 	track := probe.SubTrack{SubIndex: 2, Codec: "hdmv_pgs_subtitle", Kind: probe.SubBitmap}
-	got := joined(BurnArgs("in.mkv", track, 90*time.Second))
+	got := joined(BurnArgs("in.mkv", track, 0, 90*time.Second))
 	if !strings.Contains(got, "-ss 90.000") {
 		t.Errorf("bitmap burn should still input-seek: %s", got)
 	}
@@ -61,5 +61,15 @@ func TestBurnArgsBitmapSeekUntouched(t *testing.T) {
 	}
 	if !strings.Contains(got, "[0:v][0:s:2]overlay[vout]") {
 		t.Errorf("missing overlay filter: %s", got)
+	}
+}
+
+func TestBurnArgsMapsChosenAudioTrack(t *testing.T) {
+	for _, kind := range []probe.SubKind{probe.SubText, probe.SubBitmap} {
+		track := probe.SubTrack{SubIndex: 2, Codec: "subrip", Kind: kind}
+		got := joined(BurnArgs("in.mkv", track, 1, 0))
+		if !strings.Contains(got, "-map 0:a:1?") || strings.Contains(got, "0:a:0") {
+			t.Errorf("%s burn: want only -map 0:a:1?, got %s", kind, got)
+		}
 	}
 }

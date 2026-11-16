@@ -83,6 +83,9 @@ movcaster --sub Movie.es.srt Movie.mkv
 # The file has five subtitle tracks and you want track 3 (run --info to list them):
 movcaster --sub-track 3 Movie.mkv
 
+# Dual-audio release? English plays by default. Want the other one (see --info):
+movcaster --audio-track 0 Movie.mkv
+
 # Force the burned-in path (always works, even on the weirdest bitmap subs):
 movcaster --burn Movie.mkv
 
@@ -107,7 +110,7 @@ pins one explicitly.
 
 Once it's playing you get a little control panel:
 
-`space` play/pause · `←/→` seek 10s · `↑/↓` volume · `m` mute · `s` subtitles · `n` next episode · `q` quit
+`space` play/pause · `←/→` seek 10s · `↑/↓` volume · `m` mute · `s` subtitles · `a` audio · `n` next episode · `q` quit
 
 Press `s` to open a subtitle picker: it lists every embedded track, any sidecar
 file, and **Off**. Pick one and movcaster re-points the TV at a freshly built
@@ -116,6 +119,12 @@ stream and resumes where you were (text tracks go soft, bitmap tracks burn in).
 The picker opens on the track that's currently active and scrolls, which matters
 for releases that ship dozens of languages: `↑/↓` move a row, `pgup/pgdn` a
 screenful, `g`/`G` jump to the top and bottom, `enter` applies, `esc` cancels.
+
+Press `a` for the same picker over the audio tracks (only when the file has more
+than one). English is picked by default when there is an English track. Given
+the raw file, the TV picks a track by itself, so files with several audio tracks
+stream a copy-only remux carrying just the chosen one: no quality loss and barely
+any CPU, but each seek rebuffers for a second or two instead of jumping instantly.
 
 ## All the flags
 
@@ -128,6 +137,7 @@ movcaster <file> --info            print streams + the chosen subtitle strategy
 movcaster --probe-device [-t T]    measure what a device actually plays
 movcaster <file> --sub foo.srt     force an explicit soft subtitle
 movcaster <file> --sub-track N     pick embedded subtitle track N (see --info)
+movcaster <file> --audio-track N   pick audio track N (default: English if present)
 movcaster <file> --burn            burn the selected subtitle into the video
 movcaster <file> --soft            force soft subs (errors on bitmap tracks)
 movcaster <file> --mux-soft        remux a bitmap track as soft (experimental)
@@ -165,7 +175,8 @@ starts from the top.
 
 Don't remember which file you had on? `movcaster --resume` (no file argument)
 picks the most recently played video and continues it. If that file has since
-moved, it falls back to the next most recent. From there it behaves like a normal
+been deleted, it continues with the next episode still in the folder, and errors
+if there's none. From there it behaves like a normal
 cast, auto-advancing to the next episode on end unless you pass `--no-next`.
 
 Juggling a few shows at once? `movcaster --resume-last PATTERN` continues the most
@@ -173,7 +184,8 @@ recently played video whose name matches `PATTERN` instead of just the very last
 one. The match is fuzzy, not a regex — `movcaster --resume-last hannibal` finds
 `Hannibal S02E10 - Naka-Choko.mkv`. Case, punctuation, and word order don't
 matter, and a small typo is forgiven; an unrelated pattern that matches nothing
-closely just errors rather than casting something random.
+closely just errors rather than casting something random. Deleted files are
+handled the same way as with `--resume`.
 
 ## Next episode, automatically
 

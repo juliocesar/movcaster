@@ -35,6 +35,8 @@ type fakeAV struct {
 	transitioningAfterSet int
 	setURICount           int
 	pollsAfterSet         int
+
+	playErr error // returned by every Play (a TV that keeps rejecting it)
 }
 
 func (f *fakeAV) transitioning() bool {
@@ -55,6 +57,9 @@ func (f *fakeAV) SetAVTransportURICtx(_ context.Context, _ uint32, uri, meta str
 
 func (f *fakeAV) PlayCtx(context.Context, uint32, string) error {
 	f.calls = append(f.calls, "Play")
+	if f.playErr != nil {
+		return f.playErr
+	}
 	if f.transitioning() {
 		return errors.New("701 Transition not available")
 	}
@@ -191,5 +196,20 @@ func TestNoVolumeControl(t *testing.T) {
 	}
 	if _, err := s.Volume(context.Background()); err != engine.ErrNoVolume {
 		t.Fatalf("Volume err = %v, want ErrNoVolume", err)
+	}
+}
+
+// webOS auto-plays a freshly set URI and can reject every Play with 701 while it
+// buffers. Play succeeds when the TV is playing anyway, and fails when it isn't.
+func TestPlayToleratesRejectionWhenPlaying(t *testing.T) {
+	av := &fakeAV{playErr: errors.New("701 Transition not available"), state: "PLAYING"}
+	s := &session{av: av}
+	if err := s.Play(context.Background()); err != nil {
+		t.Fatalf("Play failed although the TV is playing: %v", err)
+	}
+	av = &fakeAV{playErr: errors.New("701 Transition not available"), state: "STOPPED"}
+	s = &session{av: av}
+	if err := s.Play(context.Background()); err == nil {
+		t.Fatal("want the Play error when the TV isn't playing")
 	}
 }

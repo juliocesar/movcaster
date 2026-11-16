@@ -80,12 +80,13 @@ func (s *session) Load(ctx context.Context, m engine.Media) error {
 // which is why callers run it off the critical path. A fresh/offset-0 stream
 // settles almost immediately, but a live transcode resumed deep into the file
 // needs several seconds to -ss-seek and emit its first MP4 fragment, so the TV
-// lingers in TRANSITIONING long past bare Play retries.
+// lingers in TRANSITIONING long past bare Play retries. A Play that still fails
+// counts as success when the TV is playing anyway (see playingAnyway).
 func (s *session) Play(ctx context.Context) error {
 	s.waitTransportSettled(ctx, 20*time.Second)
 	if err := retrySOAP(ctx, 3, 7*time.Second, func(ic context.Context) error {
 		return s.av.PlayCtx(ic, 0, "1")
-	}); err != nil {
+	}); err != nil && !s.playingAnyway(ctx) {
 		return fmt.Errorf("Play: %w", err)
 	}
 	return nil

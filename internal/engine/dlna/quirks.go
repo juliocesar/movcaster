@@ -33,6 +33,18 @@ func (s *session) waitTransportSettled(ctx context.Context, budget time.Duration
 	}
 }
 
+// playingAnyway reports whether the TV ended up playing despite a failed Play.
+// webOS auto-plays a freshly set URI, and a large direct-play file can keep it
+// buffering long enough that every Play is rejected with 701 while the stream
+// starts on its own.
+func (s *session) playingAnyway(ctx context.Context) bool {
+	s.waitTransportSettled(ctx, 10*time.Second)
+	sctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	state, _, _, err := s.av.GetTransportInfoCtx(sctx, 0)
+	return err == nil && state == "PLAYING"
+}
+
 // retrySOAP runs fn up to attempts times, each with its own per-call timeout,
 // backing off briefly between tries. It stops early if the parent ctx is done.
 // The policy (attempt counts, budgets) is DLNA-specific residual-flakiness

@@ -147,13 +147,16 @@ blank. Adding a TV family = new package + one line here.
 
 ### `main` (main.go)
 Thin CLI client. Flags: `-l -t --engine -sub -no-subs -burn -soft -sub-track
--mux-soft -transcode -info -probe-device -no-next -playlist -resume
+-audio-track -mux-soft -transcode -info -probe-device -no-next -playlist -resume
 -resume-last`. `-t` accepts IP, IP:port, `engine:host`, or a device URL;
 `--engine` restricts discovery. `-l` prints `name [addr] (engine)`.
 `--info [-t]` plans against the default or the resolved device's profile and
 prints a `-> profile:` line. `--probe-device [-t]` runs `core.ProbeDevice` and
-prints the JSON report + override. Everything else as before (resume matching,
-playlists, next-episode, event reporting).
+prints the JSON report + override. `-resume` / `-resume-last <pattern>` resume
+the newest (or best fuzzy-matched) played video, or the next episode after it
+when it was deleted (`availableOrNext` → `nextep.Find`, which only parses the
+name and lists the dir); older history entries are never used. Everything else
+as before (playlists, next-episode, event reporting).
 
 ### `internal/core` — UI-agnostic orchestration (the reusable API)
 - `App` + `New(Options)` — injectable deps: `DeviceFinder` (Discover/Resolve
@@ -167,8 +170,9 @@ playlists, next-episode, event reporting).
 - `DeviceProfile(dev)` (deviceprofile.go) — engine default merged with the
   config `device_profiles["engine:host"]` override.
 - `Prepare` / `PrepareWithProfile` — pure planning: probe + `subs.Decide` +
-  `codecPlan` against a profile. `Preparation{..., Profile, ProfileName}` +
-  `Describe{Streams,Profile,Strategy,Codec}`.
+  `selectAudio` + `codecPlan` against a profile. `Preparation{..., Audio,
+  Profile, ProfileName}` + `Describe{Streams,Profile,Strategy,Audio,Codec}`. An
+  unknown `--audio-track` lands in `DecideErr`.
 - `Start(ctx, req)` — resolve device, save config, open the session, bind the
   server, `buildDelivery`, set `media.StartAt` (resume on a `HonorsStartAt`
   engine), `sess.Load` **synchronously** (fails Start cleanly on rejection),
@@ -185,17 +189,31 @@ playlists, next-episode, event reporting).
   seek-restart = `SetTranscode(build(pos))` + `resoft` + `sess.Load` +
   `sess.Play` (the engine owns the settle/retry). `seekMu` serializes restarts
   and subtitle switches.
-- Live subtitle switching: `SubtitleChoices/ActiveSubtitle/SetSubtitle` —
-  rebuild delivery at the current position, `Load`+`Play`, then `StartAt` or
-  post-Play `Seek` per the profile.
-- `buildDelivery(srv, media, abs, tmpDir, info, subOpts, force, ss, prof)` —
+- Audio tracks (audio.go): `CastRequest.AudioTrack` (a:N, -1 = auto).
+  `selectAudio` = explicit index (must exist), else the first English track
+  (default-flagged first, commentary only if nothing else), else `defaultAudio`.
+  `directPlaysAudio` is true only for files with at most one audio track. The
+  chosen index decides the audio codec/channel check against the profile
+  (`transcode.Needs(mi, prof, a)`: an E-AC-3 a:1 copies on webOS but re-encodes
+  on Cast) and is threaded through `buildDelivery` → `applySubtitles`
+  (burn/mux-soft) and `transcode.Args`.
+- Live switching: `SubtitleChoices/ActiveSubtitle/SetSubtitle` and
+  `AudioChoices/ActiveAudio/AudioInfo/SetAudio` share `restartWith`, which
+  rebuilds delivery from the live `subOpts` + `audio` (each switch keeps the
+  other's choice) at the current position, records the new delivery state
+  *before* the TV handshake (the server already serves it, so a failed
+  handshake must not leave seeks restarting the old stream), then `Load`+`Play`
+  and `StartAt` or a post-Play `Seek` per the profile.
+- `buildDelivery(srv, media, abs, tmpDir, info, subOpts, audio, force, ss, prof)` —
   baseline direct-play → `subs.Decide(prof)` + `codecPlan(prof)` (computed
   before subtitles: any transcode/remux rebases the stream, so `subOffset = ss`
   when `Kind != TranscodeNone`) → `applySubtitles` → codec/remux fallback via
-  `transcode.Args(abs, ss, prof, plan)`. Labels: "transcode" / "remux" /
-  "soft: …" / "burn-in: …".
-- `TranscodeKind` = None | Burn | Codec | **Remux** (container-only; both
-  streams copied — a remux costs no encoding). The remux streams through the
+  `transcode.Args(abs, ss, prof, plan, audio)`. Labels: "transcode" / "remux"
+  (container) / "soft: …" / "burn-in: …"; an audio-track-only remux has no label
+  (the `Audio:` line reports it).
+- `TranscodeKind` = None | Burn | Codec | **Remux** (copy-only: the container is
+  unsupported (`TranscodePlan.Remux`), or the file has several audio tracks and
+  must carry only the chosen one — a remux costs no encoding). The remux streams through the
   same fragmented-MP4 pipe and seek-restarts. Considered alternative (rejected):
   remux to a temp file with `+faststart` for real byte ranges — costs a full
   upfront wait and disk equal to the source; the copy-only relaunch is fast.
@@ -224,12 +242,15 @@ Serves `/media*` and `/subs*` (prefix routing — URLs carry ext + `?t=token`).
 
 ### `internal/probe` — ffprobe wrapper + sub classification
 - `MediaInfo{Duration, Container, VideoCodec, AudioCodec, Height,
-  AudioChannels, Subtitles[]}` — `Container` normalized from
+  AudioChannels, Audio[], Subtitles[]}` — `Container` normalized from
   `format.format_name` (`"mov,mp4,..."`→`mp4`; `"matroska,webm"` split by
   extension so true .webm files stay `webm`). `Height`/`AudioChannels` feed the
   profile limits without a second probe pass.
 - `SubTrack{Index, SubIndex, Codec, Kind, Language, Title, Default, Forced}`;
   `SubKind` text | bitmap | unknown.
+- `AudioTrack{Index, AudioIndex (a:N selector), Codec, Language, Title,
+  Channels, Default}`. `AudioCodec`/`AudioChannels` describe the first audio
+  stream (kept for callers that don't pick a track).
 
 ### `internal/subs` — strategy + ffmpeg builders
 - `Decide(Request{Info, Profile, ...}) Decision{Kind, Format, ...}` — the tree:
@@ -246,13 +267,17 @@ Serves `/media*` and `/subs*` (prefix routing — URLs carry ext + `?t=token`).
   so VTT is sniffed for `-->`. `NoCuesAfterOffset` = "no soft subs for this
   segment", not a failure. ShiftText also converts an ss=0 sidecar whose
   extension doesn't match the profile's format.
-- `BurnArgs` — unchanged (bitmap overlay / subtitles filter + `-copyts` dance).
+- `BurnArgs(input, track, audio, ss)` — bitmap overlay / subtitles filter +
+  `-copyts` dance; maps audio `0:a:<audio>?`. `MuxSoftRemux(..., audio, ...)`
+  likewise carries only a:N.
 
 ### `internal/transcode` — codec/container compatibility
-- `Needs(mi, profile) Plan{Video, Audio, Remux}` — per-axis check against the
-  profile's sets + height/channel limits; `Remux` = container mismatch only.
-- `Args(input, ss, profile, plan)` — fragmented MP4 on pipe with the profile's
-  transcode targets; a remux-only plan copies both streams. Keeps
+- `Needs(mi, profile, audio) Plan{Video, Audio, Remux}` — per-axis check
+  against the profile's sets + height/channel limits, judging the chosen a:N
+  track's codec and channels; `Remux` = container mismatch only.
+- `Args(input, ss, profile, plan, audio)` — fragmented MP4 on pipe with the
+  profile's transcode targets, mapping only `AudioMap(a)` = `0:a:N?`; a
+  remux-only (or empty) plan copies both streams. Keeps
   `+delay_moov` + `-use_editlist 0` (load-bearing; see gotchas) on every path.
 
 ### `internal/tui` — bubbletea view (thin)
@@ -261,8 +286,11 @@ Serves `/media*` and `/subs*` (prefix routing — URLs carry ext + `?t=token`).
 - End-of-media: `StateFinished` ends immediately (Cast's clean signal); the
   `everPlayed` + `maxProgress`-within-`endGuard` inference is kept for
   `Stopped`/`Idle` (DLNA has to guess).
-- Everything else (connecting screen, seek debounce, windowed subtitle picker,
-  polling gates while seeking/switching) as before.
+- Track picker: one overlay shared by subtitles (`s`) and audio (`a`, via the
+  optional `AudioController`; opens only with 2+ tracks), keyed by `menuKind`.
+  `switchDoneMsg` ends either switch and refreshes both header labels.
+- Everything else (connecting screen, seek debounce, polling gates while
+  seeking/switching) as before.
 
 ### `internal/config` — persistence
 - `Config{LastDeviceHost, LastDeviceEngine, DeviceProfiles}` at
@@ -304,6 +332,12 @@ Engine-neutral:
 - **macOS idle sleep throttles a cast** → a live `Cast` holds `caffeinate -i`.
 - **serveTranscode sends headers before launching ffmpeg** so control calls
   don't block.
+- **Stream selectors are per-type**: `0:s:<SubIndex>`, `0:a:<AudioIndex>`, never
+  the absolute stream index.
+- **The TV picks the audio track of a direct-play file** by its own preference,
+  not the file's order or default flag (verified on webOS: a Spanish a:0 /
+  English a:1 file direct-plays as English). So any multi-track file remuxes
+  copy-only with only the chosen track mapped; single-track files direct-play.
 
 DLNA-engine (webOS) specific — all live in `internal/engine/dlna`:
 - **The TV's DLNA control port is dynamic** → always re-discover; match by host
@@ -311,7 +345,10 @@ DLNA-engine (webOS) specific — all live in `internal/engine/dlna`:
   just-woke webOS TV drops M-SEARCHes.
 - **webOS rejects SetURI and Play with 701 while `LG_TRANSITIONING`** → poll the
   transport state (never a fixed sleep) before both, and again between them;
-  the pre-Play settle matters for deep-offset transcode resumes.
+  the pre-Play settle matters for deep-offset transcode resumes. A Play that
+  still fails counts as success when the TV reports PLAYING anyway
+  (`playingAnyway`: webOS auto-plays a set URI and can 701 every Play while
+  buffering a large direct-play file).
 - **webOS does NOT demux embedded subs over DLNA** → bitmap subs burn in;
   `--mux-soft` stays the experiment.
 - **webOS honors `sec:CaptionInfoEx` for TEXT subs, but only SRT** (VTT parses

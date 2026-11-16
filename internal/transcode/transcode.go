@@ -21,9 +21,11 @@ type Plan struct {
 // Needed reports whether the file cannot be direct-played as is.
 func (p Plan) Needed() bool { return p.Video || p.Audio || p.Remux }
 
-// Needs reports what must change for p to accept mi. A nil map on the profile
-// means "accept anything" for that axis.
-func Needs(mi *probe.MediaInfo, p engine.Profile) Plan {
+// Needs reports what must change for p to accept mi when it carries the chosen
+// audio stream (a:audioTrack). A nil map on the profile means "accept anything"
+// for that axis. A file probed without per-track detail falls back to the first
+// audio stream's codec and channel count.
+func Needs(mi *probe.MediaInfo, p engine.Profile, audioTrack int) Plan {
 	if mi == nil {
 		return Plan{}
 	}
@@ -34,10 +36,14 @@ func Needs(mi *probe.MediaInfo, p engine.Profile) Plan {
 	if p.MaxVideoHeight > 0 && mi.Height > p.MaxVideoHeight {
 		plan.Video = true
 	}
-	if mi.AudioCodec != "" && p.AudioCodecs != nil && !p.AudioCodecs[mi.AudioCodec] {
+	codec, channels := mi.AudioCodec, mi.AudioChannels
+	if audioTrack >= 0 && audioTrack < len(mi.Audio) {
+		codec, channels = mi.Audio[audioTrack].Codec, mi.Audio[audioTrack].Channels
+	}
+	if codec != "" && p.AudioCodecs != nil && !p.AudioCodecs[codec] {
 		plan.Audio = true
 	}
-	if p.MaxAudioChannels > 0 && mi.AudioChannels > p.MaxAudioChannels {
+	if p.MaxAudioChannels > 0 && channels > p.MaxAudioChannels {
 		plan.Audio = true
 	}
 	if mi.Container != "" && p.Containers != nil && !p.Containers[mi.Container] {
@@ -46,16 +52,21 @@ func Needs(mi *probe.MediaInfo, p engine.Profile) Plan {
 	return plan
 }
 
+// AudioMap is the -map selector for audio stream a:N. The trailing "?" keeps a
+// file with no audio at all castable.
+func AudioMap(audioTrack int) string { return fmt.Sprintf("0:a:%d?", audioTrack) }
+
 // Args builds ffmpeg args that transcode, remux, or copy into a fragmented MP4
 // on stdout, per the plan and the profile's transcode targets. ss is the
-// absolute input-seek offset for seek-restart. A remux-only plan copies both
-// streams, so it costs no encoding.
-func Args(input string, ss time.Duration, p engine.Profile, plan Plan) []string {
+// absolute input-seek offset for seek-restart; audioTrack is the a:N stream to
+// carry (the only audio in the output). A remux-only plan copies both streams,
+// so it costs no encoding.
+func Args(input string, ss time.Duration, p engine.Profile, plan Plan, audioTrack int) []string {
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
 	if ss > 0 {
 		args = append(args, "-ss", fmt.Sprintf("%.3f", ss.Seconds()))
 	}
-	args = append(args, "-i", input, "-map", "0:v:0", "-map", "0:a:0?", "-dn", "-map_chapters", "-1")
+	args = append(args, "-i", input, "-map", "0:v:0", "-map", AudioMap(audioTrack), "-dn", "-map_chapters", "-1")
 
 	if plan.Video {
 		args = append(args, "-c:v", videoCodec(p), "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p")
