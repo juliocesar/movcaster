@@ -114,6 +114,25 @@ func TestDeriveOverride(t *testing.T) {
 	}
 }
 
+// A failed variant clip (10-bit HEVC) drops its codec even though the 8-bit
+// clip played: the profile is per codec, and listing it would direct-play
+// 10-bit files into a decoder that rejects them.
+func TestDeriveOverrideVariantVetoesCodec(t *testing.T) {
+	outcomes := make([]ProbeOutcome, len(probeMatrix))
+	for i, clip := range probeMatrix {
+		outcomes[i] = ProbeOutcome{Played: clip.variant == ""}
+	}
+	if o := deriveOverride(outcomes); contains(o.VideoCodecs, "hevc") {
+		t.Fatalf("hevc listed although its 10-bit variant failed: %v", o.VideoCodecs)
+	}
+	for i := range outcomes {
+		outcomes[i].Played = true
+	}
+	if o := deriveOverride(outcomes); !contains(o.VideoCodecs, "hevc") {
+		t.Fatalf("hevc missing although every variant played: %v", o.VideoCodecs)
+	}
+}
+
 func contains(list []string, s string) bool {
 	for _, v := range list {
 		if v == s {

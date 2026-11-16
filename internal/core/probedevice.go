@@ -26,6 +26,11 @@ type probeClip struct {
 	// special limits probes
 	size     string // "1280x720" default
 	channels int    // 1 default (sine); 6 probes the 5.1 limit
+	// variant marks a profile variant of its video codec (e.g. 10-bit HEVC).
+	// The Profile is per codec, so every variant must play for the codec to
+	// count as supported: listing it after only 8-bit played would send 10-bit
+	// files to a decoder that rejects them.
+	variant string
 }
 
 // probeMatrix is the curated set of valid (container, video, audio) muxings.
@@ -37,6 +42,8 @@ var probeMatrix = []probeClip{
 	{Container: "mp4", Video: "h264", Audio: "ac3"},
 	{Container: "mp4", Video: "h264", Audio: "eac3"},
 	{Container: "mp4", Video: "hevc", Audio: "aac", vEnc: "libx265", extra: []string{"-tag:v", "hvc1"}},
+	{Container: "mp4", Video: "hevc", Audio: "aac", vEnc: "libx265", variant: "10-bit",
+		extra: []string{"-tag:v", "hvc1", "-pix_fmt", "yuv420p10le", "-profile:v", "main10"}},
 	{Container: "mp4", Video: "av1", Audio: "aac", vEnc: "libaom-av1", extra: []string{"-cpu-used", "8", "-b:v", "500k"}},
 	{Container: "matroska", Video: "h264", Audio: "aac"},
 	{Container: "matroska", Video: "h264", Audio: "dts", aEnc: "dca", extra: []string{"-strict", "-2"}},
@@ -157,6 +164,9 @@ func (a *App) probeOne(ctx context.Context, srv MediaServer, sess engine.Session
 	if clip.channels > 1 {
 		name += fmt.Sprintf(" %dch", clip.channels)
 	}
+	if clip.variant != "" {
+		name += " " + clip.variant
+	}
 	out := ProbeOutcome{Clip: name}
 
 	path, err := generateClip(ctx, tmpDir, clip)
@@ -181,18 +191,33 @@ func (a *App) probeOne(ctx context.Context, srv MediaServer, sess engine.Session
 	_ = sess.Play(pctx)
 	pcancel()
 
-	// Watch for up to ~8s: reaching PLAYING (or finishing the 4s clip) is a
-	// pass; never leaving buffering, or landing idle without finishing, is not.
-	deadline := time.Now().Add(8 * time.Second)
+	// Watch the whole clip. Reaching PLAYING is not enough: a receiver that
+	// cannot decode the stream reports PLAYING first and errors a moment later
+	// (Cast: ERROR detailedErrorCode 102, then IDLE). So a pass is playing to the
+	// end: FINISHED, or (an engine that cannot tell the end apart) still playing
+	// or stopped once the clip's length has elapsed. Falling back to IDLE after
+	// playing is the decode-error path and fails.
+	deadline := time.Now().Add(media.Duration + 6*time.Second)
 	var last engine.State
+	played := false
 	for time.Now().Before(deadline) {
 		sctx, scancel := context.WithTimeout(ctx, 3*time.Second)
 		st, err := sess.Status(sctx)
 		scancel()
 		if err == nil {
 			last = st
-			if st.Player == engine.StatePlaying || st.Player == engine.StateFinished {
+			switch st.Player {
+			case engine.StatePlaying:
+				played = true
+			case engine.StateFinished:
 				out.Played = true
+			case engine.StateIdle:
+				if played {
+					out.Detail = "started, then errored (decoder rejected it)"
+					deadline = time.Now() // fail now
+				}
+			}
+			if out.Played {
 				break
 			}
 		}
@@ -200,8 +225,12 @@ func (a *App) probeOne(ctx context.Context, srv MediaServer, sess engine.Session
 			break
 		}
 	}
-	if !out.Played {
-		out.Detail = fmt.Sprintf("stuck in %s", last.Player)
+	if !out.Played && out.Detail == "" {
+		if played && (last.Player == engine.StatePlaying || last.Player == engine.StateStopped) {
+			out.Played = true
+		} else {
+			out.Detail = fmt.Sprintf("stuck in %s", last.Player)
+		}
 	}
 	stopCtx, scancel := context.WithTimeout(ctx, 4*time.Second)
 	_ = sess.Stop(stopCtx)
@@ -241,7 +270,10 @@ func generateClip(ctx context.Context, dir string, clip probeClip) (string, erro
 	if channels > 1 {
 		args = append(args, "-af", fmt.Sprintf("aformat=channel_layouts=%s", layoutFor(channels)))
 	}
-	args = append(args, "-c:v", vEnc, "-c:a", aEnc, "-ac", fmt.Sprint(channels))
+	// testsrc is RGB, so without a pix_fmt the encoders pick 4:4:4, which TV
+	// decoders commonly reject while real files are 4:2:0. A variant clip's
+	// extra args set its own (later flags win).
+	args = append(args, "-c:v", vEnc, "-pix_fmt", "yuv420p", "-c:a", aEnc, "-ac", fmt.Sprint(channels))
 	args = append(args, clip.extra...)
 	args = append(args, "-f", clip.Container, out)
 
@@ -282,8 +314,15 @@ func deriveOverride(outcomes []ProbeOutcome) config.ProfileOverride {
 	acodecs := map[string]bool{}
 	var o config.ProfileOverride
 	baselinePlayed := false
+	vetoed := map[string]bool{} // video codecs with a variant that failed
 	for i, out := range outcomes {
 		clip := probeMatrix[i]
+		if clip.variant != "" {
+			if !out.Played && out.Skipped == "" {
+				vetoed[clip.Video] = true
+			}
+			continue
+		}
 		if clip.size == "" && clip.channels == 0 && out.Played {
 			containers[clip.Container] = true
 			vcodecs[clip.Video] = true
@@ -304,6 +343,9 @@ func deriveOverride(outcomes []ProbeOutcome) config.ProfileOverride {
 				o.MaxAudioChannels = 2
 			}
 		}
+	}
+	for v := range vetoed {
+		delete(vcodecs, v)
 	}
 	o.Containers = sortedKeys(containers)
 	o.VideoCodecs = sortedKeys(vcodecs)

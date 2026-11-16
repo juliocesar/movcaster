@@ -232,8 +232,12 @@ as before (playlists, next-episode, event reporting).
   remux to a temp file with `+faststart` for real byte ranges — costs a full
   upfront wait and disk equal to the source; the copy-only relaunch is fast.
 - `ProbeDevice(ctx, target, only)` (probedevice.go) — generates 4s lavfi clips
-  over a curated (container, video, audio) matrix + 4K + 5.1 limit probes,
-  casts each, watches for `StatePlaying`/`StateFinished` (~8s), derives a
+  (forced 4:2:0: testsrc is RGB and encoders otherwise emit 4:4:4, which TV
+  decoders reject, so every clip "fails" on its video) over a curated
+  (container, video, audio) matrix + a 10-bit HEVC variant + 4K + 5.1 limit
+  probes, casts each, and passes it only when it plays to the end
+  (`StateFinished`; a receiver that can't decode reports PLAYING and then
+  errors back to IDLE). A failed variant drops its codec. Derives a
   `config.ProfileOverride` (axis supported when ANY tuple carrying it played;
   a skipped clip — missing local encoder — says nothing) and saves it under
   `device_profiles["engine:host"]` when at least one clip played (a run where
