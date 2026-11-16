@@ -50,7 +50,7 @@ homebrew_casks:
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: "https://github.com/juliocesar/movcaster"
-    description: "Stream local video to a DLNA renderer (LG webOS TV) from the terminal"
+    description: "Stream local video to your TV from the terminal over DLNA or Google Cast"
     dependencies:
       - formula: ffmpeg
     commit_author:
